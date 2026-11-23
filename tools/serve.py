@@ -4228,18 +4228,18 @@ def _danmaku_ready():
     return bool(sess and jct)
 
 
-def _send_danmaku(msg):
+def _send_danmaku(msg, room):
     """发一条弹幕，返回 (B 站 code, message)。code=0 才是成功。"""
     _, jct = load_credentials()
     body = urllib.parse.urlencode({
         "bubble": "0", "msg": msg, "color": "16777215", "mode": "1",
-        "fontsize": "25", "roomid": cur_room(), "rnd": str(int(time.time())),
+        "fontsize": "25", "roomid": room, "rnd": str(int(time.time())),
         "csrf": jct, "csrf_token": jct,
     }).encode("utf-8")
     sess = load_credentials()[0]
     req = urllib.request.Request("https://api.live.bilibili.com/msg/send", data=body, headers={
         "User-Agent": UA,
-        "Referer": "https://live.bilibili.com/%s" % cur_room(),
+        "Referer": "https://live.bilibili.com/%s" % room,
         "Origin": "https://live.bilibili.com",
         "Content-Type": "application/x-www-form-urlencoded",
         "Cookie": "SESSDATA=%s; bili_jct=%s" % (sess, jct),
@@ -4260,7 +4260,7 @@ def api_live_send(obj):
         return 400, {"error": "弹幕最长 %d 个字（当前 %d 个）" % (DANMAKU_MAX_LEN, len(msg))}
     if not _danmaku_ready():
         return 403, {"error": "发弹幕需要登录，并粘贴 bili_jct（直播间页右侧有入口）"}
-    code, message = _send_danmaku(msg)
+    code, message = _send_danmaku(msg, cur_room())
     return (200 if code == 0 else 502), {"code": code, "message": message}
 
 
@@ -4273,12 +4273,12 @@ WHEEL = {
 }
 
 
-def _wheel_worker():
+def _wheel_worker(room):
     st = WHEEL
     fails = 0
     try:
         while st["sent"] < st["total"] and not st["stop"].is_set():
-            code, message = _send_danmaku(st["msg"])
+            code, message = _send_danmaku(st["msg"], room)
             st["last_code"], st["last_message"] = code, message
             if code == 0:
                 st["sent"] += 1
@@ -4322,9 +4322,9 @@ def api_live_wheel_start(obj):
     with WHEEL_LOCK:
         if WHEEL["running"]:
             return 409, {"error": "独轮车已在运行，先停止再重新开始"}
-        WHEEL.update(running=True, msg=msg, interval=interval, total=count, sent=0,
+        WHEEL.update(running=True, room_id=cur_room(), msg=msg, interval=interval, total=count, sent=0,
                      last_code=None, last_message="", reason="", stop=threading.Event())
-        threading.Thread(target=_wheel_worker, daemon=True).start()
+        threading.Thread(target=_wheel_worker, args=(cur_room(),), daemon=True).start()
     return 200, {"ok": True, "interval": interval, "count": count}
 
 
@@ -4339,7 +4339,7 @@ def api_live_wheel_stop():
 def api_live_wheel_status():
     st = {k: WHEEL[k] for k in ("running", "msg", "interval", "total", "sent",
                                 "last_code", "last_message", "reason")}
-    st["room_id"] = cur_room()
+    st["room_id"] = WHEEL.get("room_id") if st["running"] else cur_room()
     st["danmaku_ready"] = _danmaku_ready()
     st["motto"] = WHEEL_MOTTO
     return 200, st
@@ -8634,8 +8634,11 @@ class Handler(SimpleHTTPRequestHandler):
     def do_GET(self):
         parsed = urllib.parse.urlparse(self.path)
         # 主播上下文：?station=<id|mid|房间号>，不带则用主站。必须在所有处理之前设置
-        use_station(urllib.parse.parse_qs(parsed.query).get("station", [""])[0])
         q = urllib.parse.parse_qs(parsed.query)
+        station = q.get("station", [""])[0]
+        use_station(station)
+        if station and parsed.path.startswith("/api/live/") and _CUR.station is None:
+            return self._json(404, {"error": "直播间主播已移除，请重新选择房间"})
         if empty_state(parsed.path):
             return self._json(200, {"ok": True, "empty": True})
         if parsed.path in MEDIA_PATHS:
@@ -8835,7 +8838,10 @@ class Handler(SimpleHTTPRequestHandler):
     def do_POST(self):
         """直播弹幕相关接口。凭据走 POST body，不能走 GET —— 会整个进访问日志。"""
         parsed = urllib.parse.urlparse(self.path)
-        use_station(urllib.parse.parse_qs(parsed.query).get("station", [""])[0])
+        station = urllib.parse.parse_qs(parsed.query).get("station", [""])[0]
+        use_station(station)
+        if station and parsed.path in ("/api/live/send", "/api/live/wheel/start") and _CUR.station is None:
+            return self._json(404, {"error": "弹幕目标主播已移除，请重新选择房间"})
         if empty_state(parsed.path):
             return self._json(200, {"ok": True, "empty": True})
         try:

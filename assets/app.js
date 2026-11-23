@@ -2872,7 +2872,7 @@
     destroyDash();
     destroyLive();
     livePlayer = mpegts.createPlayer({
-      type: 'flv', isLive: true, url: '/api/live/stream?qn=' + (qn || 250),
+      type: 'flv', isLive: true, url: broadcastUrl('/api/live/stream?qn=' + (qn || 250)),
       // 关掉 stash 缓冲：默认值会先攒一段再喂给 <video>，实测进直播间要多等约 1 秒。
       // 直播不需要「起播顺滑」，要的是尽快看到画面（网络抖动导致的卡顿由下面的重连兜底）。
       enableStashBuffer: false,
@@ -2899,7 +2899,88 @@
     } catch (e) { /* 浏览器可能要求用户手势 */ }
   }
 
+  var broadcastGeneration = 0;
+  var broadcastStation = '';
+  var broadcastGrid = document.getElementById('broadcast-grid');
+  var broadcastSelect = document.getElementById('broadcast-station');
+
+  function broadcastUrl(path) {
+    return path + (path.indexOf('?') < 0 ? '?' : '&') + 'station=' + encodeURIComponent(broadcastStation);
+  }
+
+  function selectBroadcastChat(s) {
+    chatStop();
+    broadcastStation = s.id;
+    broadcastSelect.value = s.id;
+    el.liveResult.textContent = '';
+    el.liveMsg.value = '';
+    el.liveInfo.textContent = '正在与 ' + (s.name || s.short || s.id) + ' 互动';
+    el.liveOpen.title = '打开 ' + (s.name || s.id) + ' 的原直播间';
+    el.liveOpen.hidden = !/^\d+$/.test(String(s.room));
+    if (!el.liveOpen.hidden) el.liveOpen.href = 'https://live.bilibili.com/' + s.room;
+    broadcastGrid.querySelectorAll('[data-chat]').forEach(function (btn) {
+      btn.setAttribute('aria-pressed', String(btn.dataset.chat === s.id));
+    });
+    chatStart();
+  }
+
+  function clearBroadcastGrid() {
+    broadcastGeneration++;
+    if (!broadcastGrid.hidden) {
+      broadcastGrid.replaceChildren();
+      multiTeardown();
+    }
+    broadcastGrid.hidden = true;
+    document.getElementById('broadcast-target').hidden = true;
+  }
+
+  function showBroadcastGrid(generation) {
+    broadcastGrid.hidden = false;
+    el.liveOpen.hidden = true;
+    el.liveInfo.textContent = '正在读取已选直播间…';
+    fetchStations().then(function (list) {
+      if (generation !== broadcastGeneration || state.view !== 'broadcast') return;
+      var rooms = ST_SET.map(function (id) {
+        return list.find(function (s) { return s.id === id; });
+      }).filter(Boolean);
+      if (!rooms.length) {
+        el.liveInfo.textContent = '无法读取已选主播，请重新选择房间。';
+        return;
+      }
+      broadcastSelect.replaceChildren();
+      rooms.forEach(function (s) {
+        var name = s.short || s.name || s.id;
+        broadcastSelect.add(new Option(name, s.id));
+        var cell = document.createElement('article');
+        cell.dataset.id = s.id;
+        cell.innerHTML = '<video muted playsinline controls></video><header>'
+          + '<button type="button" class="btn small ghost" data-chat="' + esc(s.id)
+          + '" title="切换到这个房间的弹幕">' + esc(name) + '</button>'
+          + '<select class="ms-qn" aria-label="直播画质"></select>'
+          + '<button type="button" class="btn small ghost" data-retry>重连</button>'
+          + '<span data-role="state">正在获取开播状态…</span></header>';
+        broadcastGrid.appendChild(cell);
+        cell.querySelector('[data-chat]').onclick = function () { selectBroadcastChat(s); };
+        cell.querySelector('[data-retry]').onclick = function () { multiRestartCell(cell); };
+        cell.querySelector('.ms-qn').onchange = function (e) {
+          cell._qn = Number(e.target.value);
+          multiRestartCell(cell);
+        };
+        startMultiCell(s, cell, { view: 'broadcast' });
+      });
+      broadcastSelect.onchange = function () {
+        selectBroadcastChat(rooms[broadcastSelect.selectedIndex]);
+      };
+      document.getElementById('broadcast-target').hidden = false;
+      selectBroadcastChat(rooms[0]);
+      document.getElementById('live-send-card').hidden = false;
+    });
+  }
+
   function renderBroadcast() {
+    clearBroadcastGrid();
+    chatStop();
+    broadcastStation = ST;
     if (!liveInit) {
       liveInit = true;
       bindLive();
@@ -2919,7 +3000,9 @@
     // 别的播放入口忘了停，也不会出现「直播间里还在放录播」。
     el.player.pause();
     el.banner.hidden = true;
-    loadLiveInfo();
+    document.getElementById('live-send-card').hidden = ST_SET.length > 1;
+    if (ST_SET.length > 1) showBroadcastGrid(broadcastGeneration);
+    else loadLiveInfo();
     refreshLiveCred();
     pollWheel();
     if (!wheelTimer) wheelTimer = setInterval(pollWheel, 1000);
@@ -2933,7 +3016,9 @@
   }
 
   function loadLiveInfo() {
-    fetch('/api/live/playinfo').then(function (r) { return r.json(); }).then(function (d) {
+    var generation = broadcastGeneration;
+    fetch(broadcastUrl('/api/live/playinfo')).then(function (r) { return r.json(); }).then(function (d) {
+      if (generation !== broadcastGeneration || state.view !== 'broadcast') return;
       var qnList = d.qualities || [];
       /* 「原直播间」按钮的落点：用服务端给的 room_id（就是当前板块的直播间号）。
          未开播也能点进去看主页，所以放在 living 判断之前；号不可用就藏起来。 */
@@ -2951,13 +3036,13 @@
       // 直播间不再另放一个「清晰度」—— 同一个功能摆两处只会互相打架。
       if (qnList.length) setQualityList(qnList, d.current_qn);
       if (!d.living) {
-        el.liveInfo.innerHTML = '<b>未开播</b>';
+        el.liveInfo.textContent = d.error || '未开播';
         el.quality.innerHTML = '<option value="">未开播</option>';
         el.quality.disabled = true;
         renderQnList();
         syncQnLabel();
         chatStop();
-        liveOffline(ST_SHORT + '现在没开播，这里只会显示直播画面。');
+        liveOffline(d.error || ST_SHORT + '现在没开播，这里只会显示直播画面。');
         return;
       }
       el.liveInfo.innerHTML = '<b>直播中</b> · ' + esc(d.title || '（无标题）')
@@ -2974,7 +3059,7 @@
       startLive(d.current_qn);
       chatStart();
     }).catch(function () {
-      el.liveInfo.textContent = '直播状态获取失败（本机服务没起？）';
+      if (generation === broadcastGeneration) el.liveInfo.textContent = '直播状态获取失败（本机服务没起？）';
     });
   }
 
@@ -3018,12 +3103,14 @@
       if (!msg) { el.liveResult.textContent = '先输入弹幕内容'; return; }
       liveBusy = true;
       el.liveSend.disabled = true;
-      postJSON('/api/live/send', { msg: msg })
+      var target = broadcastStation;
+      postJSON(broadcastUrl('/api/live/send'), { msg: msg })
         .then(function (d) {
+          if (target !== broadcastStation) return;
           el.liveResult.textContent = d.error ? d.error
             : (d.code === 0 ? '已发送 ✓' : 'B 站返回：' + (d.message || d.code));
         })
-        .catch(function () { el.liveResult.textContent = '发送失败，请重试'; })
+        .catch(function () { if (target === broadcastStation) el.liveResult.textContent = '发送失败，请重试'; })
         .then(function () { liveBusy = false; el.liveSend.disabled = false; });
     }
     el.liveSend.addEventListener('click', function () { sendOnce(); });
@@ -3100,7 +3187,7 @@
       var msg = el.wheelMsg.value.trim();
       if (!msg) { el.wheelState.textContent = '先输入要循环的弹幕'; return; }
       liveBusy = true;
-      postJSON('/api/live/wheel/start', {
+      postJSON(broadcastUrl('/api/live/wheel/start'), {
         msg: msg,
         interval: parseFloat(el.wheelInterval.value) || 3,
         count: parseInt(el.wheelCount.value, 10) || 20
@@ -3157,7 +3244,7 @@
       }
       var last = d.last_code == null ? '还没发第一条'
         : (d.last_code === 0 ? '最近一条成功 ✓' : '最近一条失败：' + (d.last_message || d.last_code));
-      el.wheelState.textContent = '运行中：已发 ' + d.sent + ' / ' + d.total
+      el.wheelState.textContent = '房间 ' + d.room_id + ' · 已发 ' + d.sent + ' / ' + d.total
         + ' 条（每 ' + d.interval + ' 秒 1 条）· ' + last;
     }).catch(function () { /* 服务没起时静默，不打扰 */ });
   }
@@ -3196,7 +3283,7 @@
     el.liveChatState.textContent = '连接中…';
     // 必须自己带上 station：stq() 包装的是 window.fetch，管不到 EventSource。
     // 不带的话副站的直播间会订阅到**主站**的弹幕（主站没播就是空面板）。
-    chatEs = new EventSource(stq('/api/live/chat/stream'));
+    chatEs = new EventSource(broadcastUrl('/api/live/chat/stream'));
     chatEs.onopen = function () { el.liveChatState.textContent = '已连接 · 实时弹幕中'; };
     chatEs.onmessage = function (ev) {
       var j;
@@ -4331,6 +4418,10 @@
         && state.cycle && !state.playlistCycle) {
       state.replayMemo = replayPosNow() || state.replayMemo;
     }
+    if (prev === 'broadcast' && name !== 'broadcast') {
+      clearBroadcastGrid();
+      if (name === 'multi') destroyLive();
+    }
     state.view = name;
     syncDocTitle();               // 标签页标题跟着当前板块名走
     if (prev !== name) {
@@ -4443,13 +4534,13 @@
     }
 
     if (name === 'live') renderList();
-    else if (name === 'broadcast') renderBroadcast();
+    else if (name === 'broadcast' && (prev !== name || !liveInit)) renderBroadcast();
     else if (name === 'schedule') renderSchedule();
     else if (name === 'about') renderAbout();
     else if (name === 'settings') renderSettings();
 
     if (name !== 'broadcast') {
-      if (prev === 'broadcast') resumeReplay();
+      if (prev === 'broadcast' && name !== 'multi') resumeReplay();
       chatStop();
       if (wheelTimer) {                              // 离开直播间页就停止轮询
         clearInterval(wheelTimer);
@@ -8919,6 +9010,9 @@
       }, delayMs || 0);
     }
 
+    // 直播页可直接进入，已选主播可能都没有回放清单。
+    if (location.hash === '#/broadcast') route();
+
     if (isMainOnly() && window.PROGRAMS && window.PROGRAMS.programs
         && window.PROGRAMS.programs.length) {
       boot(window.PROGRAMS);
@@ -9479,6 +9573,10 @@
        否则几只狗同时咬同一格，会各自销毁对方刚建好的 player。 */
     cell._gen = (cell._gen || 0) + 1;
     var gen = cell._gen;
+    var view = src.view || 'multi';
+    function active() {
+      return cell.isConnected && cell._gen === gen && state.view === view;
+    }
     var video = cell.querySelector('video');
     var off = cell.querySelector('.ms-off');
     var sub = cell.querySelector('.ms-off-sub');
@@ -9509,7 +9607,7 @@
 
     function connect(qualities, attempt) {
       if (typeof mpegts === 'undefined') { offline('播放库缺失（assets/mpegts.js）'); return; }
-      if (!cell.isConnected) return;     // 这一格已被移除（取消勾选），别再连
+      if (!active()) return;     // 这一格已被移除（取消勾选），别再连
       /* ⚠️ 复用同一个 <video> 重新接 MSE 之前，必须先把上一路的 src 摘掉。
          mpegts 的 destroy() 只断开 MediaSource，元素上残留的 blob: src 会让新的
          player attach 失败 —— 表现正是「重连了 5 次、服务端取流都成功、画面还是不动」。
@@ -9550,9 +9648,10 @@
         if (pr && typeof pr.catch === 'function') pr.catch(function () { /* 等用户手势 */ });
       } catch (e) { /* 浏览器可能要求手势 */ }
       p.on(mpegts.Events.ERROR, function () {
+        if (!active() || cell._p !== p) return;
         try { p.destroy(); } catch (e) { /* 已销毁 */ }
         if (cell._p === p) cell._p = null;
-        if (!cell.isConnected) return;   // 格子已移除：别再挂重连定时器
+        if (!active()) return;   // 格子已移除：别再挂重连定时器
         if (attempt < maxTry) {
           stateEl.textContent = '连接中断，重连中…（' + (attempt + 1) + '/' + maxTry + '）';
           multiTimers.push(setTimeout(function () { connect(qualities, attempt + 1); }, 3000));
@@ -9588,7 +9687,7 @@
        现在：connect() 里复位 lastT/lastProgress/loadedAt；装载期（readyState<2）
        给 20 秒预算；时间轴回退（< lastT-1，被追帧拉回或换了媒体）也按重新计时。 */
     var dog = setInterval(function () {
-      if (!cell.isConnected || state.view !== 'multi' || cell._gen !== gen) {
+      if (!active()) {
         clearInterval(dog);
         return;
       }
@@ -9604,6 +9703,7 @@
         return;
       }
       if (Date.now() - lastProgress < 12000) return;
+      if (video.paused && view === 'broadcast' && video.readyState >= 2) return;
       if (video.paused) {                            // 被浏览器挂起：先叫一次 play()
         try {
           var pr2 = video.play();
@@ -9621,7 +9721,7 @@
       }
       stateEl.textContent = '画面停住，正在重连…（' + stallN + '）';
       multiTimers.push(setTimeout(function () {
-        if (cell.isConnected && state.view === 'multi') connect(cell._qs || [], 0);
+        if (active()) connect(cell._qs || [], 0);
       }, Math.min(30000, 2000 * stallN)));
     }, 3000);
     multiTimers.push(dog);
@@ -9629,18 +9729,18 @@
     fetch(src.info || '/api/live/playinfo?station=' + encodeURIComponent(s.id))
       .then(function (r) { return r.json(); })
       .then(function (d) {
-        if (state.view !== 'multi') return;   // 同上：等开播状态回来时可能已经切走了
+        if (!active()) return;   // 同上：等开播状态回来时可能已经切走了
         cell.classList.remove('loading');
         var sel = cell.querySelector('.ms-qn');
         if (sel && d && d.qualities && d.qualities.length) {
           sel.innerHTML = d.qualities.map(function (x) {
             return '<option value="' + x.qn + '">' + esc(x.desc || x.qn) + '</option>';
           }).join('');
-          sel.value = String(cell._qn || d.current_qn || d.qualities[0].qn);
+          sel.value = String(cell._qn || multiPickQn(multiQnChoice(), d.qualities));
         }
         if (!d || !d.living) {
           cell._manual = false;          // 手动重连碰到「没开播」：这不是重连成功
-          offline(d && d.title ? ('未开播 · ' + d.title) : '未开播');
+          offline((d && d.error) || (d && d.title ? ('未开播 · ' + d.title) : '未开播'));
           return;
         }
         cell._qs = d.qualities || [];        // 看门狗重连时直接用这份档位表
@@ -9649,7 +9749,7 @@
           stateEl.textContent = '已重新连接 · ' + (d.title || '直播中');
           if (off) off.style.display = 'none';
           multiTimers.push(setTimeout(function () {
-            if (cell.isConnected && state.view === 'multi') live(d.title);
+            if (active()) live(d.title);
           }, 4000));
         } else {
           live(d.title);

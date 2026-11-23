@@ -2776,6 +2776,30 @@ body.view-broadcast .next,
 body.view-broadcast .credits { display: none; }
 
 body.view-broadcast { overflow: hidden; }
+#broadcast-grid:not([hidden]) {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 240px), 1fr));
+  align-content: center;
+  gap: 10px;
+}
+body.view-broadcast #broadcast-grid:not([hidden]) + .player-box { display: none; }
+body.view-broadcast .col-right:has(#broadcast-grid:not([hidden])) {
+  max-height: 100%;
+  min-height: 0;
+  overflow: auto;
+}
+#broadcast-grid article { min-width: 0; }
+#broadcast-grid video {
+  display: block;
+  width: 100%;
+  aspect-ratio: 16 / 9;
+  background: #111;
+  border-radius: 8px;
+}
+#broadcast-grid header { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+#broadcast-grid [aria-pressed="true"] { color: var(--red); }
+#broadcast-grid [data-role="state"] { color: var(--muted); font-size: 12px; }
+#broadcast-target select { max-width: 100%; }
 body.view-broadcast .views,
 body.view-broadcast.theater .views { display: contents; }   /* section 直接落进 .wrap 网格 */
 body.view-broadcast .wrap,

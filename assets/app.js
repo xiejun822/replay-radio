@@ -2907,27 +2907,61 @@
   var broadcastLayout = document.getElementById('broadcast-layout');
   var broadcastRects = store.get('xl_broadcast_rects', {});
   if (!broadcastRects || typeof broadcastRects !== 'object') broadcastRects = {};
-  broadcastLayout.value = store.get('xl_broadcast_layout') === 'free' ? 'free' : 'auto';
+  var broadcastMode = store.get('xl_broadcast_layout', 'free');
+  var broadcastToolbar = document.getElementById('broadcast-toolbar');
+  var chatToggle = document.getElementById('broadcast-chat-toggle');
+  var chatCollapsed = store.get('xl_broadcast_chat_collapsed', false) === true;
 
   function arrangeBroadcast() {
-    var free = broadcastLayout.value === 'free';
-    broadcastGrid.classList.toggle('multi-grid', free);
-    broadcastGrid.classList.toggle('free', free);
     var cells = broadcastGrid.querySelectorAll('article');
-    cells.forEach(function (cell, i) {
-      if (!free) { cell.removeAttribute('style'); return; }
-      var rect = freeRectFor(broadcastRects, cell.dataset.id, i, cells.length);
-      cell.style.left = rect.x + '%';
-      cell.style.top = rect.y + '%';
-      cell.style.width = rect.w + '%';
-      cell.style.height = rect.h + '%';
+    if (broadcastGrid.hidden || !cells.length) return;
+    var free = broadcastMode === 'free';
+    broadcastGrid.classList.toggle('free', free);
+    var width = broadcastGrid.clientWidth, height = broadcastGrid.clientHeight;
+    if (!width || !height) return;
+    if (free) {
+      broadcastGrid.style.gridTemplateColumns = broadcastGrid.style.gridTemplateRows = '';
+      cells.forEach(function (cell, i) {
+        var rect = freeRectFor(broadcastRects, cell.dataset.id, i, cells.length);
+        var h = rect.h;
+        if (!broadcastRects[cell.dataset.id]) h = Math.min(h, rect.w * width * 9 / (16 * height));
+        cell.style.left = rect.x + '%';
+        cell.style.top = rect.y + '%';
+        cell.style.width = rect.w + '%';
+        cell.style.height = h + '%';
+      });
+    } else {
+      var plan = multiPlan(cells.length, width, height, broadcastMode, '');
+      var size = multiTileSize(plan.cols, plan.rows, width, height);
+      broadcastGrid.style.gridTemplateColumns = 'repeat(' + plan.cols + ', ' + size.w + 'px)';
+      broadcastGrid.style.gridTemplateRows = 'repeat(' + plan.rows + ', ' + size.h + 'px)';
+      cells.forEach(function (cell) { cell.removeAttribute('style'); });
+    }
+    broadcastLayout.querySelectorAll('[data-layout]').forEach(function (button) {
+      var active = button.dataset.layout === broadcastMode;
+      button.classList.toggle('on', active);
+      button.setAttribute('aria-pressed', String(active));
     });
   }
 
-  broadcastLayout.onchange = function () {
-    store.set('xl_broadcast_layout', broadcastLayout.value);
+  function syncBroadcastSidebar() {
+    document.body.classList.toggle('broadcast-chat-hidden', !broadcastGrid.hidden && chatCollapsed);
+    chatToggle.textContent = chatCollapsed ? '展开弹幕' : '收起弹幕';
+    chatToggle.setAttribute('aria-expanded', String(!chatCollapsed));
+  }
+  chatToggle.onclick = function () {
+    chatCollapsed = !chatCollapsed;
+    store.set('xl_broadcast_chat_collapsed', chatCollapsed);
+    syncBroadcastSidebar();
+  };
+  broadcastLayout.onclick = function (e) {
+    var button = e.target.closest('[data-layout]');
+    if (!button) return;
+    broadcastMode = button.dataset.layout;
+    store.set('xl_broadcast_layout', broadcastMode);
     arrangeBroadcast();
   };
+  new ResizeObserver(arrangeBroadcast).observe(broadcastGrid);
   bindFreeDrag(broadcastGrid, function () {
     saveFreeRects(broadcastGrid, broadcastRects, 'xl_broadcast_rects');
   });
@@ -2958,12 +2992,14 @@
       broadcastGrid.replaceChildren();
       multiTeardown();
     }
-    broadcastGrid.hidden = true;
+    broadcastGrid.hidden = broadcastToolbar.hidden = true;
+    syncBroadcastSidebar();
     document.getElementById('broadcast-target').hidden = true;
   }
 
   function showBroadcastGrid(generation) {
-    broadcastGrid.hidden = false;
+    broadcastGrid.hidden = broadcastToolbar.hidden = false;
+    syncBroadcastSidebar();
     el.liveOpen.hidden = true;
     el.liveInfo.textContent = '正在读取已选直播间…';
     fetchStations().then(function (list) {
@@ -2981,13 +3017,32 @@
         broadcastSelect.add(new Option(name, s.id));
         var cell = document.createElement('article');
         cell.dataset.id = s.id;
-        cell.innerHTML = '<video muted playsinline controls></video><header><span class="broadcast-grip" title="拖动调整位置">⠿</span>'
-          + '<button type="button" class="btn small ghost" data-chat="' + esc(s.id)
-          + '" title="切换到这个房间的弹幕">' + esc(name) + '</button>'
-          + '<select class="ms-qn" aria-label="直播画质"></select>'
-          + '<button type="button" class="btn small ghost" data-retry>重连</button>'
-          + '<span data-role="state">正在获取开播状态…</span></header>' + msHandlesHtml();
+        cell.className = 'ms-cell loading';
+        cell.innerHTML = '<video muted playsinline></video>'
+          + msOffHtml(name, s.face, '正在获取开播状态…')
+          + '<div class="ms-bar"><button type="button" class="btn small ghost" data-chat="' + esc(s.id)
+          + '" title="切换弹幕房间">' + esc(name) + '</button><span class="ms-state" data-role="state"></span>'
+          + '<div class="ms-btns"><select class="ms-qn" aria-label="直播画质"></select>'
+          + '<input class="ms-vol" type="range" min="0" max="100" value="0" aria-label="音量">'
+          + '<button class="ms-btn" type="button" data-play title="播放 / 暂停" aria-label="播放 / 暂停">⏯</button>'
+          + '<button class="ms-btn" type="button" data-full title="全屏" aria-label="全屏">⛶</button>'
+          + '<button class="ms-btn" type="button" data-retry title="重新连接" aria-label="重新连接">↻</button></div></div>'
+          + msHandlesHtml();
         broadcastGrid.appendChild(cell);
+        cell.querySelector('.ms-vol').oninput = function (e) {
+          var video = cell.querySelector('video');
+          video.volume = Number(e.target.value) / 100;
+          video.muted = video.volume === 0;
+        };
+        cell.querySelector('[data-play]').onclick = function () {
+          var video = cell.querySelector('video');
+          if (video.paused) video.play().catch(function () {});
+          else video.pause();
+        };
+        cell.querySelector('[data-full]').onclick = function () {
+          if (document.fullscreenElement === cell) document.exitFullscreen();
+          else cell.requestFullscreen();
+        };
         cell.querySelector('[data-chat]').onclick = function () { selectBroadcastChat(s); };
         cell.querySelector('[data-retry]').onclick = function () { multiRestartCell(cell); };
         cell.querySelector('.ms-qn').onchange = function (e) {
@@ -3127,7 +3182,8 @@
     function sendOnce(msg) {
       if (liveBusy) return;
       // 传参时用参数（常用弹幕一键发送走这条路，不经过输入框），不传时取输入框
-      if (msg === undefined) msg = el.liveMsg.value;
+      var draft = msg === undefined ? el.liveMsg.value : null;
+      if (draft !== null) msg = draft;
       msg = String(msg).trim();
       if (!msg) { el.liveResult.textContent = '先输入弹幕内容'; return; }
       liveBusy = true;
@@ -3136,6 +3192,9 @@
       postJSON(broadcastUrl('/api/live/send'), { msg: msg })
         .then(function (d) {
           if (target !== broadcastStation) return;
+          if (!d.error && d.code === 0 && draft !== null && el.liveMsg.value === draft) {
+            el.liveMsg.value = '';
+          }
           el.liveResult.textContent = d.error ? d.error
             : (d.code === 0 ? '已发送 ✓' : 'B 站返回：' + (d.message || d.code));
         })
@@ -3144,7 +3203,7 @@
     }
     el.liveSend.addEventListener('click', function () { sendOnce(); });
     el.liveMsg.addEventListener('keydown', function (e) {
-      if (e.key === 'Enter') sendOnce();
+      if (e.key === 'Enter' && !e.isComposing) sendOnce();
     });
 
     /* ---- 常用弹幕：一键发送。列表只存本机浏览器，服务端只收最终那条文本 ---- */
@@ -9931,7 +9990,7 @@
       if (!grid.classList.contains('free') || e.button !== 0) return;
       var cell = e.target.closest ? e.target.closest('[data-id]') : null;
       if (!cell) return;
-      if (e.target.closest('button, select, input') || (grid === broadcastGrid && e.target.closest('video'))) return;
+      if (e.target.closest('button, select, input')) return;
       var hd = (e.target.getAttribute && e.target.getAttribute('data-hd')) || '';
       e.preventDefault();
       var box = grid.getBoundingClientRect();
@@ -10452,8 +10511,8 @@
     return true;
   }
 
-  function multiPlan(n, availW, availH) {
-    if (multiFocusId && n > 1 && multiLayout !== 'free') {
+  function multiPlan(n, availW, availH, layout, focus) {
+    if (focus && n > 1 && layout !== 'free') {
       /* 聚焦时副画面必须读作「一条底排 + 一列右侧」。宫格能做到这件事的唯一形态是
          **3 列**（主画面 2×2 → 右侧只剩 1 列）+ **3 行**（底排只剩 1 排），容量 5 个陪衬。
          4 列时右侧会变成两列、4 行时下方会变成两排 —— 都是用户明确禁止的。
@@ -10469,8 +10528,8 @@
       // 6 路以内（陪衬 ≤5）：3 列 × 3 行本来就正好，格子是纯 16:9、不裁切。
       return multiBestPlan(n, availW, availH, true, m >= 3 ? 3 : 6);
     }
-    if (multiLayout === 'auto') return multiBestPlan(n, availW, availH, false);
-    var fixed = { g1: 1, g2: 2, g4: 2, g6: 3, g9: 3 }[multiLayout];
+    if (layout === 'auto') return multiBestPlan(n, availW, availH, false);
+    var fixed = { g1: 1, g2: 2, g4: 2, g6: 3, g9: 3 }[layout];
     if (!fixed) return multiBestPlan(n, availW, availH, false);
     return { cols: fixed, rows: Math.ceil(n / fixed), main: false };
   }
@@ -10704,7 +10763,7 @@
       multiPortraitLayout(grid, cells, availW, winH);
       return;
     }
-    var plan = multiPlan(n, availW, grid.clientHeight);
+    var plan = multiPlan(n, availW, grid.clientHeight, multiLayout, multiFocusId);
     if (plan.fill) {
       if (layoutMultiFill(grid, n, grid.clientWidth, grid.clientHeight, cells)) return;
       // 万一某个尺寸下算不出「底排 + 右列」的几何（墙太窄/太矮），退回 3 列宫格：

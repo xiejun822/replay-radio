@@ -2776,38 +2776,23 @@ body.view-broadcast .next,
 body.view-broadcast .credits { display: none; }
 
 body.view-broadcast { overflow: hidden; }
+#broadcast-toolbar:not([hidden]) { display: flex; align-items: center; flex-wrap: wrap; gap: 10px; margin-bottom: 8px; }
 #broadcast-grid:not([hidden]) {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(min(100%, 240px), 1fr));
-  align-content: center;
-  gap: 10px;
+  position: relative; display: grid; width: 100%; height: max(260px, calc(100dvh - var(--topbar-h) - 132px));
+  justify-content: center; align-content: center; gap: 4px;
 }
-body.view-broadcast #broadcast-grid:not([hidden]) + .player-box { display: none; }
-body.view-broadcast .col-right:has(#broadcast-grid:not([hidden])) {
-  max-height: 100%;
-  min-height: 0;
-  overflow: auto;
-}
-#broadcast-grid article { min-width: 0; }
-#broadcast-grid video {
-  display: block;
-  width: 100%;
-  aspect-ratio: 16 / 9;
-  background: #111;
-  border-radius: 8px;
-}
-#broadcast-grid header { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
-#broadcast-grid [aria-pressed="true"] { color: var(--red); }
-#broadcast-grid [data-role="state"] { color: var(--muted); font-size: 12px; }
+#broadcast-grid.free:not([hidden]) { display: block; }
+#broadcast-grid article { min-width: 0; user-select: none; }
+#broadcast-grid article:fullscreen { width: 100% !important; height: 100% !important; }
+#broadcast-grid .ms-bar { flex-wrap: wrap; }
+#broadcast-grid .ms-off { pointer-events: none; }
+#broadcast-grid [data-chat][aria-pressed="true"] { border-color: var(--red); }
 #broadcast-target:not([hidden]) { display: flex; flex-wrap: wrap; gap: 8px; }
-#broadcast-grid.free:not([hidden]) { display: block; position: relative; height: max(320px, calc(100dvh - var(--topbar-h) - 110px)); }
-#broadcast-grid.free article { position: absolute; display: flex; flex-direction: column; background: var(--panel); overflow: hidden; }
-#broadcast-grid.free video { flex: 1 1 0; min-height: 0; object-fit: contain; }
-#broadcast-grid.free header { cursor: move; touch-action: none; padding: 4px 8px; }
-#broadcast-grid .broadcast-grip { display: none; }
-#broadcast-grid.free .broadcast-grip { display: inline; cursor: grab; }
-#broadcast-grid.free .ms-h { touch-action: none; }
-#broadcast-grid [data-chat][aria-pressed="true"] { background: var(--red); color: var(--on-red, #161616); }
+body.view-broadcast #broadcast-grid:not([hidden]) + .player-box { display: none; }
+body.view-broadcast .col-right:has(#broadcast-grid:not([hidden])) { align-self: start; min-width: 0; }
+body.view-broadcast.broadcast-chat-hidden .wrap { grid-template-columns: minmax(0, 1fr); }
+body.view-broadcast.broadcast-chat-hidden #view-broadcast { display: none; }
+body.view-broadcast.broadcast-chat-hidden .col-right { grid-column: 1; }
 #broadcast-target select { max-width: 100%; }
 body.view-broadcast .views,
 body.view-broadcast.theater .views { display: contents; }   /* section 直接落进 .wrap 网格 */

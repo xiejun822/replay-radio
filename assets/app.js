@@ -10274,11 +10274,13 @@
 
   function bindFreeDrag(grid, onDrop) {
     grid.addEventListener('pointerdown', function (e) {
-      if (!grid.classList.contains('free') || e.button !== 0) return;
+      if (!grid.classList.contains('free') || e.button !== 0 || !e.isPrimary) return;
       var cell = e.target.closest ? e.target.closest('[data-id]') : null;
       if (!cell) return;
       if (e.target.closest('button, select, input, a')) return;
       var hd = (e.target.getAttribute && e.target.getAttribute('data-hd')) || '';
+      var canSwap = grid === broadcastGrid && !hd;
+      var target = null;
       e.preventDefault();
       var box = grid.getBoundingClientRect();
       var sx = e.clientX, sy = e.clientY;
@@ -10293,8 +10295,23 @@
       cell.classList.add('dragging');
 
       var pointerId = e.pointerId;
+      cell.setPointerCapture(pointerId);
+      function updateTarget(ev) {
+        // 按实际堆叠顺序找光标下的另一张卡；跨域播放器的 iframe 在本页也是普通元素。
+        var next = null;
+        for (var element of document.elementsFromPoint(ev.clientX, ev.clientY)) {
+          var other = element.closest('.ms-cell');
+          if (other && other !== cell && other.parentElement === grid) { next = other; break; }
+          if (element === grid) break;
+        }
+        if (next === target) return;
+        if (target) target.classList.remove('drop-target');
+        target = next;
+        if (target) target.classList.add('drop-target');
+      }
       function moveTo(ev) {
         if (ev.pointerId !== pointerId) return;
+        if (!movedPx && canSwap && Math.hypot(ev.clientX - sx, ev.clientY - sy) < 5) return;
         movedPx = true;
         var dx = (ev.clientX - sx) / box.width * 100;
         var dy = (ev.clientY - sy) / box.height * 100;
@@ -10322,6 +10339,7 @@
         cell.style.top = y + '%';
         cell.style.width = w + '%';
         cell.style.height = h + '%';
+        if (canSwap) updateTarget(ev);
       }
 
       function stop(ev) {
@@ -10329,12 +10347,25 @@
         window.removeEventListener('pointermove', moveTo);
         window.removeEventListener('pointerup', stop);
         window.removeEventListener('pointercancel', stop);
+        cell.removeEventListener('lostpointercapture', stop);
         cell.classList.remove('dragging');
-        if (movedPx) onDrop();
+        if (movedPx && canSwap && ev.type === 'pointerup') updateTarget(ev);
+        if (target) target.classList.remove('drop-target');
+        if (!movedPx || !grid.classList.contains('free') || cell.parentElement !== grid) return;
+        if (ev.type !== 'pointerup' || target) {
+          var original = {left:r.x + '%', top:r.y + '%', width:r.w + '%', height:r.h + '%'};
+          if (ev.type !== 'pointerup') { Object.assign(cell.style, original); return; }
+          Object.keys(original).forEach(function (prop) {
+            cell.style[prop] = target.style[prop];
+            target.style[prop] = original[prop];
+          });
+        }
+        onDrop();
       }
       window.addEventListener('pointermove', moveTo);
       window.addEventListener('pointerup', stop);
       window.addEventListener('pointercancel', stop);
+      cell.addEventListener('lostpointercapture', stop);
     });
   }
 

@@ -3880,6 +3880,8 @@ body.view-multi .col-right { display: none; }
   outline: 2px solid var(--red);
   outline-offset: -2px;
 }
+#broadcast-grid.free .ms-cell.drop-target { outline: 3px solid var(--red); outline-offset: -3px; }
+#broadcast-grid.free .ms-cell.dragging:not(:has(.ms-h:active)) { opacity: .68; }
 
 /* 自由布局：卡片绝对定位，左/上/宽/高都是画布的百分比（记忆在 localStorage） */
 .multi-grid.free { display: block; position: relative; }

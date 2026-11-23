@@ -3062,6 +3062,7 @@
       room = url.searchParams.get('rid') || (path[0] === 'room' ? path[1] : path[0]);
       if (!/^\d+$/.test(room || '')) throw new Error('请输入含数字房间号的斗鱼直播间链接');
       original = 'https://www.douyu.com/' + room;
+      embed = original + '#js-player-dialog';
     } else if (['huya.com','www.huya.com','m.huya.com'].includes(host)) {
       platform = 'huya';
       room = path[0] === 'room' ? path[1] : path[0];
@@ -3102,9 +3103,17 @@
       + '<span class="outside-grip" title="拖动调整位置">⠿ 移动</span>'
       + '<button class="btn small ghost" type="button" data-chat="' + esc(s.id) + '">' + esc(s.name) + '</button>'
       + '<a target="_blank" rel="noopener noreferrer">原直播间 ↗</a>'
+      + (s.platform === 'douyu' ? '<button type="button" class="btn small ghost" data-room-view>完整房间</button>' : '')
       + '<button type="button" class="btn small ghost" data-share>共享标签页</button>'
       + '<button type="button" class="btn small ghost" data-remove>移除</button></div>' + msHandlesHtml();
     var media = cell.querySelector('.outside-media');
+    var roomView = cell.querySelector('[data-room-view]');
+    if (roomView) {
+      roomView.onclick = function () {
+        var focused = media.classList.toggle('douyu-focused');
+        roomView.textContent = focused ? '完整房间' : '聚焦播放器';
+      };
+    }
     var link = cell.querySelector('a');
     link.href = s.url;
     function showSource(note) {
@@ -3115,7 +3124,15 @@
         frame.allow = 'autoplay; fullscreen; encrypted-media';
         frame.allowFullscreen = true;
         frame.src = s.embed;
-        media.appendChild(frame);
+        if (roomView) {
+          var viewport = document.createElement('div');
+          viewport.className = 'douyu-viewport';
+          viewport.appendChild(frame);
+          media.appendChild(viewport);
+          media.classList.add('douyu-focused');
+          roomView.hidden = false;
+          roomView.textContent = '完整房间';
+        } else media.appendChild(frame);
       } else {
         var help = document.createElement('span');
         help.textContent = note || '先打开原直播间并播放，再点「共享标签页」选择该页。声音由原标签页播放。';
@@ -3145,6 +3162,7 @@
         video.autoplay = video.muted = video.playsInline = true;
         video.srcObject = stream;
         media.replaceChildren(video);
+        if (roomView) roomView.hidden = true;
         track.onended = function () {
           if (video.srcObject === stream && cell.isConnected) { stopOutsideCapture(cell); showSource('共享已结束，可重新选择直播标签页。'); }
         };

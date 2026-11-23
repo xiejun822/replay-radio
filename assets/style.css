@@ -2809,6 +2809,18 @@ body.view-broadcast .reward-card { flex: 0 0 auto; }
 .outside-media { flex: 1; min-height: 0; display: grid; place-items: center; overflow: hidden; }
 .outside-media span { padding: 10px; color: #eee; }
 .outside-media iframe, .outside-media video { border: 0; width: 100%; height: 100%; }
+.outside-media:has(.douyu-viewport) { position: relative; container-type: size; }
+.douyu-viewport { position: absolute; inset: 0; overflow: hidden; }
+/* 斗鱼桌面房间的播放器锚点。固定内页宽度，再随卡片缩放，避免拖动时反复触发站内重排。 */
+@supports (transform: scale(calc(100cqw / 658px))) {
+  .douyu-focused .douyu-viewport {
+    inset: 50% auto auto 50%; width: 658px; height: 410px;
+    transform: translate(-50%, -50%) scale(min(calc(100cqw / 658px), calc(100cqh / 410px)));
+  }
+  .douyu-focused .douyu-viewport iframe {
+    position: absolute; left: -32px; top: -60px; width: 700px; height: 470px;
+  }
+}
 .outside-actions { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; padding: 3px 9px; color: white; }
 #broadcast-grid.free .outside-actions { cursor: move; touch-action: none; }
 .outside-grip { display: none; }

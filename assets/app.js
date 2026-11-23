@@ -2983,7 +2983,7 @@
     rewardItems.replaceChildren();
     rewardSend.disabled = true;
     rewardText.hidden = rewardKind.value !== 'sc';
-    if (rewardPanel.hidden || state.view !== 'broadcast') return;
+    if (document.body.classList.contains('outside-selected') || rewardPanel.hidden || state.view !== 'broadcast') return;
     var station = broadcastStation || MAIN_ID;
     if (!station) { rewardNote.textContent = '请选择主播'; return; }
     rewardNote.textContent = '正在读取房间与价格…';
@@ -3043,6 +3043,166 @@
       });
   };
 
+  var outsideNames = {douyu:'斗鱼', huya:'虎牙', douyin:'抖音'};
+  var outsideKey = 'xl_broadcast_external_rooms';
+  var outsideRooms = [];
+  var outsideDialog = document.getElementById('outside-dialog');
+  var outsideError = document.getElementById('outside-error');
+
+  function parseOutsideRoom(value, label) {
+    var match = String(value || '').match(/https?:\/\/[^\s<>"，。]+/i);
+    if (!match) throw new Error('请粘贴完整的直播间链接');
+    var url = new URL(match[0]);
+    if (url.username || url.password || url.port) throw new Error('直播间链接的地址格式不正确');
+    var host = url.hostname.toLowerCase();
+    var path = url.pathname.split('/').filter(Boolean);
+    var room, platform, original, embed = '';
+    if (['douyu.com','www.douyu.com','m.douyu.com'].includes(host)) {
+      platform = 'douyu';
+      room = url.searchParams.get('rid') || (path[0] === 'room' ? path[1] : path[0]);
+      if (!/^\d+$/.test(room || '')) throw new Error('请输入含数字房间号的斗鱼直播间链接');
+      original = 'https://www.douyu.com/' + room;
+    } else if (['huya.com','www.huya.com','m.huya.com'].includes(host)) {
+      platform = 'huya';
+      room = path[0] === 'room' ? path[1] : path[0];
+      if (!room || !/^[a-z\d_-]+$/i.test(room)) throw new Error('请输入含房间号或主播别名的虎牙链接');
+      original = 'https://www.huya.com/' + room;
+      embed = 'https://liveshare.huya.com/iframe/' + room;
+    } else if (host === 'live.douyin.com' || host === 'v.douyin.com') {
+      platform = 'douyin';
+      room = path[0];
+      if (!room || !(host === 'v.douyin.com' ? /^[a-z\d_-]+$/i : /^\d+$/).test(room)) throw new Error('请输入抖音直播间链接或分享短链');
+      original = 'https://' + host + '/' + room + (host === 'v.douyin.com' ? '/' : '');
+    } else throw new Error('支持斗鱼、虎牙和抖音直播间链接');
+    return {id:platform + '-' + room, platform:platform, url:original, embed:embed,
+      name:(typeof label === 'string' && label.trim().slice(0,50)) || outsideNames[platform] + ' ' + room};
+  }
+
+  var savedOutside = store.get(outsideKey, []);
+  if (Array.isArray(savedOutside)) savedOutside.forEach(function (row) {
+    try {
+      var room = parseOutsideRoom(row.url, row.name);
+      if (!outsideRooms.some(function (s) { return s.id === room.id; })) outsideRooms.push(room);
+    } catch (e) { /* 陈旧或损坏的单条记录不影响其余房间 */ }
+  });
+
+  function stopOutsideCapture(cell) {
+    var video = cell.querySelector('video');
+    if (video && video.srcObject) {
+      video.srcObject.getTracks().forEach(function (track) { track.stop(); });
+      video.srcObject = null;
+    }
+  }
+
+  function addOutsideCell(s) {
+    var cell = document.createElement('article');
+    cell.className = 'ms-cell outside-cell';
+    cell.dataset.id = s.id;
+    cell.innerHTML = '<div class="outside-media"></div><div class="outside-actions">'
+      + '<span class="outside-grip" title="拖动调整位置">⠿ 移动</span>'
+      + '<button class="btn small ghost" type="button" data-chat="' + esc(s.id) + '">' + esc(s.name) + '</button>'
+      + '<a target="_blank" rel="noopener noreferrer">原直播间 ↗</a>'
+      + '<button type="button" class="btn small ghost" data-share>共享标签页</button>'
+      + '<button type="button" class="btn small ghost" data-remove>移除</button></div>' + msHandlesHtml();
+    var media = cell.querySelector('.outside-media');
+    var link = cell.querySelector('a');
+    link.href = s.url;
+    function showSource(note) {
+      media.replaceChildren();
+      if (s.embed) {
+        var frame = document.createElement('iframe');
+        frame.title = s.name;
+        frame.allow = 'autoplay; fullscreen; encrypted-media';
+        frame.allowFullscreen = true;
+        frame.src = s.embed;
+        media.appendChild(frame);
+      } else {
+        var help = document.createElement('span');
+        help.textContent = note || '先打开原直播间并播放，再点「共享标签页」选择该页。声音由原标签页播放。';
+        media.appendChild(help);
+      }
+    }
+    showSource();
+    var share = cell.querySelector('[data-share]');
+    share.onclick = async function () {
+      if (!navigator.mediaDevices || !navigator.mediaDevices.getDisplayMedia) {
+        window.alert('请用 Chrome 或 Edge 打开本机页面，再选择共享直播标签页。');
+        return;
+      }
+      share.disabled = true;
+      try {
+        var stream = await navigator.mediaDevices.getDisplayMedia({
+          video:{displaySurface:'browser'}, audio:false, selfBrowserSurface:'exclude', surfaceSwitching:'exclude'
+        });
+        var track = stream.getVideoTracks()[0];
+        if (!cell.isConnected || (track.getSettings().displaySurface && track.getSettings().displaySurface !== 'browser')) {
+          stream.getTracks().forEach(function (t) { t.stop(); });
+          if (cell.isConnected) window.alert('请选择直播所在的浏览器标签页。');
+          return;
+        }
+        stopOutsideCapture(cell);
+        var video = document.createElement('video');
+        video.autoplay = video.muted = video.playsInline = true;
+        video.srcObject = stream;
+        media.replaceChildren(video);
+        track.onended = function () {
+          if (video.srcObject === stream && cell.isConnected) { stopOutsideCapture(cell); showSource('共享已结束，可重新选择直播标签页。'); }
+        };
+      } catch (err) {
+        if (err.name !== 'NotAllowedError' && cell.isConnected) window.alert('无法共享标签页：' + err.message);
+      } finally { share.disabled = false; }
+    };
+    cell.querySelector('[data-chat]').onclick = function () { selectBroadcastChat(s); };
+    cell.querySelector('[data-remove]').onclick = function () {
+      outsideRooms = outsideRooms.filter(function (r) { return r.id !== s.id; });
+      store.set(outsideKey, outsideRooms);
+      stopOutsideCapture(cell);
+      cell.remove();
+      var opt = Array.from(broadcastSelect.options).find(function (o) { return o.value === s.id; });
+      if (opt) opt.remove();
+      if (!outsideRooms.length && ST_SET.length <= 1) { renderBroadcast(); return; }
+      if (broadcastStation === s.id && broadcastSelect.options.length) {
+        broadcastSelect.selectedIndex = 0;
+        broadcastSelect.onchange();
+      }
+      arrangeBroadcast();
+    };
+    var option = new Option(s.name, s.id);
+    option.room = s;
+    broadcastSelect.add(option);
+    broadcastGrid.appendChild(cell);
+  }
+
+  document.querySelectorAll('[data-add-outside]').forEach(function (b) {
+    b.onclick = function () {
+      outsideError.textContent = '';
+      outsideDialog.showModal();
+      document.getElementById('outside-url').focus();
+    };
+  });
+  document.getElementById('outside-cancel').onclick = function () { outsideDialog.close(); };
+  document.getElementById('outside-form').onsubmit = function (event) {
+    event.preventDefault();
+    try {
+      var url = document.getElementById('outside-url'), label = document.getElementById('outside-name');
+      var room = parseOutsideRoom(url.value, label.value);
+      if (outsideRooms.some(function (s) { return s.id === room.id; })) throw new Error('这个房间已在画面墙中');
+      outsideRooms.push(room);
+      store.set(outsideKey, outsideRooms);
+      url.value = label.value = '';
+      outsideDialog.close();
+      if (!document.getElementById('onboard').hidden) {
+        sessionStorage.setItem(PICK_KEY,'1');
+        location.hash = '#/broadcast';
+        location.reload();
+      } else if (!broadcastGrid.hidden && broadcastSelect.options.length) {
+        addOutsideCell(room);
+        arrangeBroadcast();
+        selectBroadcastChat(room);
+      } else renderBroadcast();
+    } catch (err) { outsideError.textContent = err.message; }
+  };
+
   function broadcastUrl(path) {
     return path + (path.indexOf('?') < 0 ? '?' : '&') + 'station=' + encodeURIComponent(broadcastStation);
   }
@@ -3051,6 +3211,20 @@
     chatStop();
     if (broadcastStation !== s.id) rewardText.value = "";
     broadcastStation = s.id;
+    document.body.classList.toggle('outside-selected', !!s.platform && !!s.url && !!outsideNames[s.platform]);
+    if (s.url && outsideNames[s.platform]) {
+      rewardOffer = null;
+      rewardGeneration++;
+      broadcastSelect.value = s.id;
+      el.liveOpen.hidden = false;
+      el.liveOpen.href = s.url;
+      el.liveOpen.title = '打开' + outsideNames[s.platform] + '原直播间';
+      el.liveInfo.textContent = s.name + ' · 弹幕与礼物请在' + outsideNames[s.platform] + '原直播间操作';
+      broadcastGrid.querySelectorAll('[data-chat]').forEach(function (btn) {
+        btn.setAttribute('aria-pressed', String(btn.dataset.chat === s.id));
+      });
+      return;
+    }
     refreshRewards();
     broadcastSelect.value = s.id;
     el.liveResult.textContent = '';
@@ -3067,6 +3241,8 @@
 
   function clearBroadcastGrid() {
     broadcastGeneration++;
+    document.body.classList.remove('outside-selected');
+    broadcastGrid.querySelectorAll('.outside-cell').forEach(stopOutsideCapture);
     rewardGeneration++;
     rewardOffer = null;
     if (!broadcastGrid.hidden) {
@@ -3085,17 +3261,20 @@
     el.liveInfo.textContent = '正在读取已选直播间…';
     fetchStations().then(function (list) {
       if (generation !== broadcastGeneration || state.view !== 'broadcast') return;
+      broadcastSelect.replaceChildren();
       var rooms = ST_SET.map(function (id) {
         return list.find(function (s) { return s.id === id; });
       }).filter(Boolean);
-      if (!rooms.length) {
-        el.liveInfo.textContent = '无法读取已选主播，请重新选择房间。';
+      if (!rooms.length && !outsideRooms.length) {
+        document.body.classList.add('outside-selected');
+        el.liveInfo.textContent = '画面墙还没有房间。点「添加其他平台」粘贴直播间链接。';
         return;
       }
-      broadcastSelect.replaceChildren();
       rooms.forEach(function (s) {
         var name = s.short || s.name || s.id;
-        broadcastSelect.add(new Option(name, s.id));
+        var option = new Option(name, s.id);
+        option.room = s;
+        broadcastSelect.add(option);
         var cell = document.createElement('article');
         cell.dataset.id = s.id;
         cell.className = 'ms-cell loading';
@@ -3132,12 +3311,13 @@
         };
         startMultiCell(s, cell, { view: 'broadcast' });
       });
+      outsideRooms.forEach(addOutsideCell);
       arrangeBroadcast();
       broadcastSelect.onchange = function () {
-        selectBroadcastChat(rooms[broadcastSelect.selectedIndex]);
+        selectBroadcastChat(broadcastSelect.selectedOptions[0].room);
       };
       document.getElementById('broadcast-target').hidden = false;
-      selectBroadcastChat(rooms[0]);
+      selectBroadcastChat(rooms[0] || outsideRooms[0]);
       document.getElementById('live-send-card').hidden = false;
     });
   }
@@ -3165,8 +3345,9 @@
     // 别的播放入口忘了停，也不会出现「直播间里还在放录播」。
     el.player.pause();
     el.banner.hidden = true;
-    document.getElementById('live-send-card').hidden = ST_SET.length > 1;
-    if (ST_SET.length > 1) showBroadcastGrid(broadcastGeneration);
+    var useWall = ST_SET.length > 1 || outsideRooms.length > 0 || !STATIONS.length;
+    document.getElementById('live-send-card').hidden = useWall;
+    if (useWall) showBroadcastGrid(broadcastGeneration);
     else { loadLiveInfo(); refreshRewards(); }
     refreshLiveCred();
     pollWheel();
@@ -8355,6 +8536,13 @@
     var box = document.getElementById('onboard');
     if (!box) return;
     box.hidden = false;
+    var openWall = document.getElementById('ob-open-wall');
+    openWall.hidden = !outsideRooms.length;
+    openWall.onclick = function () {
+      sessionStorage.setItem(PICK_KEY, '1');
+      location.hash = '#/broadcast';
+      location.reload();
+    };
 
     var grid = document.getElementById('ob-grid');
     var form = document.getElementById('ob-form');
@@ -8777,7 +8965,7 @@
       var picked = false;
       try { picked = sessionStorage.getItem(PICK_KEY) === '1'; } catch (e) { /* 隐私模式 */ }
       // 有主播且这个会话已经选过人 → 直接进频道；否则停在选择页
-      if (list.length && picked) initMain();
+      if ((list.length || outsideRooms.length) && picked) initMain();
       else showPicker(!list.length);
     }).catch(function () {
       initMain();                  // 服务不在：按老路子走，让页面自己报「未连接」
@@ -10071,7 +10259,7 @@
       if (!grid.classList.contains('free') || e.button !== 0) return;
       var cell = e.target.closest ? e.target.closest('[data-id]') : null;
       if (!cell) return;
-      if (e.target.closest('button, select, input')) return;
+      if (e.target.closest('button, select, input, a')) return;
       var hd = (e.target.getAttribute && e.target.getAttribute('data-hd')) || '';
       e.preventDefault();
       var box = grid.getBoundingClientRect();

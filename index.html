@@ -144,6 +144,16 @@ window.__BOOT_T0 = Date.now();
      已添加的主播各自一张卡（点头像进频道），末尾一张加号卡展开添加表单。
      每次新开页面都先停在这里选人；选完写进本会话标记，刷新不再重复出现。
      后端此时若是空态，节目类接口一律回空 —— 页面在这里停下等用户操作。 -->
+<dialog id="outside-dialog">
+  <form id="outside-form">
+    <h3>添加其他平台直播间</h3>
+    <label>直播间链接<input id="outside-url" type="text" required placeholder="斗鱼、虎牙或抖音直播间链接"></label>
+    <label>显示名称（选填）<input id="outside-name" maxlength="50"></label>
+    <p id="outside-error" role="status"></p>
+    <button id="outside-cancel" type="button" class="btn ghost">取消</button>
+    <button type="submit" class="btn primary">添加到画面墙</button>
+  </form>
+</dialog>
 <div id="onboard" hidden>
   <div class="ob-head">
     <div class="ob-brand">24H RADIO</div>
@@ -151,6 +161,8 @@ window.__BOOT_T0 = Date.now();
     <p class="ob-sub" id="ob-sub">选择要进入的频道，或添加一位新主播。</p>
   </div>
 
+  <button type="button" class="btn small ghost" data-add-outside>添加斗鱼、虎牙或抖音直播间</button>
+  <button type="button" class="btn small ghost" id="ob-open-wall" hidden>进入已保存的画面墙</button>
   <div class="ob-grid" id="ob-grid"></div>
 
   <div class="ob-card ob-card-form" id="ob-form" hidden>
@@ -479,6 +491,7 @@ window.__BOOT_T0 = Date.now();
           <a class="btn small ghost live-wheel-btn" id="live-open" href="#"
              target="_blank" rel="noopener noreferrer" hidden>原直播间 ↗</a>
         </div>
+        <button type="button" class="btn small ghost" data-add-outside>＋ 添加其他平台</button>
         <div id="broadcast-target" hidden>
           <label>弹幕房间 <select id="broadcast-station"></select></label>
         </div>
@@ -1306,6 +1319,7 @@ window.__BOOT_T0 = Date.now();
 
   <aside class="col-right">
     <div id="broadcast-toolbar" hidden>
+      <button type="button" class="btn small ghost" data-add-outside>＋ 添加其他平台</button>
         <div class="multi-layout" id="broadcast-layout" aria-label="直播间排列">
           <button class="on" data-layout="auto" type="button" title="按路数自动排，铺满窗口">自适应</button>
           <button data-layout="g1" type="button" title="单画面">1</button>

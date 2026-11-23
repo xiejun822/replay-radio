@@ -3881,6 +3881,11 @@ body.view-multi .col-right { display: none; }
   outline-offset: -2px;
 }
 #broadcast-grid.free .ms-cell.drop-target { outline: 3px solid var(--red); outline-offset: -3px; }
+#broadcast-grid.free.snap-x::before, #broadcast-grid.free.snap-y::after {
+  content: ''; position: absolute; z-index: 60; pointer-events: none; background: var(--red);
+}
+#broadcast-grid.free.snap-x::before { top: 0; bottom: 0; left: var(--snap-x); width: 1px; }
+#broadcast-grid.free.snap-y::after { left: 0; right: 0; top: var(--snap-y); height: 1px; }
 #broadcast-grid.free .ms-cell.dragging:not(:has(.ms-h:active)) { opacity: .68; }
 
 /* 自由布局：卡片绝对定位，左/上/宽/高都是画布的百分比（记忆在 localStorage） */

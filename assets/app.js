@@ -10272,6 +10272,27 @@
     });
   }
 
+  // 坐标用画布百分比，吸附距离按屏幕像素换算。缩放时只动手柄所在的边。
+  function snapFreeAxis(start, size, resizeStart, resizeEnd, resizing, edges, tolerance, minimum) {
+    var best = {start:start, size:size, line:null};
+    var distance = Infinity;
+    for (var end of [false, true]) {
+      if (resizing && !(end ? resizeEnd : resizeStart)) continue;
+      var edge = end ? start + size : start;
+      for (var line of edges) {
+        var delta = line - edge, gap = Math.abs(delta);
+        if (gap > tolerance || gap >= distance) continue;
+        var nextStart = resizing && end ? start : start + delta;
+        var nextSize = resizing ? size + (end ? delta : -delta) : size;
+        if (nextStart < -0.00001 || nextStart + nextSize > 100.00001) continue;
+        if (resizing && nextSize < minimum) continue;
+        best = {start:Math.max(0, nextStart), size:nextSize, line:line};
+        distance = gap;
+      }
+    }
+    return best;
+  }
+
   function bindFreeDrag(grid, onDrop) {
     grid.addEventListener('pointerdown', function (e) {
       if (!grid.classList.contains('free') || e.button !== 0 || !e.isPrimary) return;
@@ -10283,6 +10304,15 @@
       var target = null;
       e.preventDefault();
       var box = grid.getBoundingClientRect();
+      var xEdges = [], yEdges = [];
+      if (grid === broadcastGrid) {
+        grid.querySelectorAll('.ms-cell').forEach(function (other) {
+          if (other === cell) return;
+          var left = parseFloat(other.style.left), top = parseFloat(other.style.top);
+          xEdges.push(left, left + parseFloat(other.style.width));
+          yEdges.push(top, top + parseFloat(other.style.height));
+        });
+      }
       var sx = e.clientX, sy = e.clientY;
       var movedPx = false;
       var r = {
@@ -10335,11 +10365,23 @@
           x = Math.min(100 - w, Math.max(0, r.x + dx));
           y = Math.min(100 - h, Math.max(0, r.y + dy));
         }
+        if (canSwap) updateTarget(ev);
+        if (grid === broadcastGrid) {
+          var horizontal = snapFreeAxis(x, w, hd.includes('w'), hd.includes('e'), !!hd,
+            target ? [] : xEdges, 8 * 100 / box.width, FREE_MIN_W);
+          var vertical = snapFreeAxis(y, h, hd.includes('n'), hd.includes('s'), !!hd,
+            target ? [] : yEdges, 8 * 100 / box.height, FREE_MIN_H);
+          x = horizontal.start; w = horizontal.size;
+          y = vertical.start; h = vertical.size;
+          grid.classList.toggle('snap-x', horizontal.line !== null);
+          grid.classList.toggle('snap-y', vertical.line !== null);
+          if (horizontal.line !== null) grid.style.setProperty('--snap-x', horizontal.line + '%');
+          if (vertical.line !== null) grid.style.setProperty('--snap-y', vertical.line + '%');
+        }
         cell.style.left = x + '%';
         cell.style.top = y + '%';
         cell.style.width = w + '%';
         cell.style.height = h + '%';
-        if (canSwap) updateTarget(ev);
       }
 
       function stop(ev) {
@@ -10349,6 +10391,7 @@
         window.removeEventListener('pointercancel', stop);
         cell.removeEventListener('lostpointercapture', stop);
         cell.classList.remove('dragging');
+        grid.classList.remove('snap-x', 'snap-y');
         if (movedPx && canSwap && ev.type === 'pointerup') updateTarget(ev);
         if (target) target.classList.remove('drop-target');
         if (!movedPx || !grid.classList.contains('free') || cell.parentElement !== grid) return;

@@ -4252,6 +4252,141 @@ def _send_danmaku(msg, room):
     return int(d.get("code") or 0), d.get("message") or ""
 
 
+# Paid interactions use a short-lived, single-use catalog for the chosen station.
+# Only the local confirmation page can consume it. Network I/O stays outside the lock.
+_REWARD_OFFERS = {}
+_REWARD_LOCK = threading.Lock()
+_LIVE_BASE = "https://api.live.bilibili.com"
+
+
+def reward_read(path, params, room):
+    data = bili_get(_LIVE_BASE + path + "?" + urllib.parse.urlencode(params),
+                    "https://live.bilibili.com/" + room)
+    if data.get("code") != 0:
+        raise ValueError(data.get("message") or data.get("msg") or "B 站未提供此房间的价格")
+    return data["data"]
+
+
+def reward_catalog(kind):
+    session, csrf = load_credentials()
+    if not session or not csrf:
+        raise ValueError("请先扫码登录 B 站")
+    account = api_status()[1]
+    if not account.get("mid"):
+        raise ValueError("登录已失效，请重新扫码")
+    st = cur_station()
+    room = str(st["room"])
+    meta = reward_read("/room/v1/Room/get_info", {"room_id": room}, room)
+    room = str(meta["room_id"])
+    anchor = str(meta["uid"])
+    if anchor != str(st["mid"]):
+        raise ValueError("房间对应的主播已变化，请刷新主播资料")
+    items = []
+    if kind == "gift":
+        data = reward_read("/xlive/web-room/v1/giftPanel/roomGiftList",
+                           {"room_id": room, "platform": "pc", "source": "live"}, room)
+        configs = {}
+        for key in ("base_config", "room_config"):
+            group = data["gift_config"].get(key) or []
+            for gift in (group.get("list", []) if isinstance(group, dict) else group):
+                configs.setdefault(gift["id"], {}).update(gift)
+        for row in data["gift_data"]["room_gift_list"].get("gold_list") or []:
+            gift = {**configs.get(row["gift_id"], {}), **row}
+            special = gift.get("special") or {}
+            scene = gift.get("gift_scene") or {}
+            if gift.get("coin_type") != "gold" or gift.get("gift_type", 0) or gift.get("type", 0):
+                continue
+            if scene.get("pay_type", "send_gift") != "send_gift" or special.get("special_type", 0) not in (0, 3):
+                continue
+            if not special.get("is_use", 1) or not gift.get("perm", 1) or not gift.get("is_use", 1):
+                continue
+            if gift.get("price", 0) > 0 and gift.get("name"):
+                items.append({"id": row["gift_id"], "name": gift["name"], "gold": gift["price"]})
+    elif kind == "sc":
+        config = reward_read("/av/v1/SuperChat/config", {"room_id": room, "ruid": anchor,
+                             "area_id": meta["area_id"], "parent_area_id": meta["parent_area_id"]}, room)
+        if (config.get("user_ban_info") or {}).get("limited"):
+            raise ValueError("当前账号在该房间的醒目留言功能受限")
+        for tier in config.get("price_configs") or []:
+            if tier.get("type", 0) == 0 and tier["price"] > 0 and tier["limit"] > 0:
+                items.append({"id": tier["id"], "name": "醒目留言", "gold": tier["price"] * 1000,
+                              "limit": tier["limit"], "level": tier["level"], "goods": config.get("goods_id") or 12})
+    else:
+        raise ValueError("请选择礼物或醒目留言")
+    if not items:
+        raise ValueError("当前房间暂无可发送的普通礼物" if kind == "gift" else "当前房间暂无可发送的 SC 档位")
+    token = os.urandom(16).hex()
+    now = time.monotonic()
+    with _REWARD_LOCK:
+        for key in list(_REWARD_OFFERS):
+            if _REWARD_OFFERS[key]["expires"] <= now:
+                del _REWARD_OFFERS[key]
+        _REWARD_OFFERS[token] = dict(expires=now+180, room=room, configured_room=str(st["room"]), anchor=anchor,
+                                     kind=kind, station=st["id"], uid=account["mid"], session=session, items=items)
+    return {"offer": token, "items": items, "room": room, "name": st.get("name") or st["id"]}
+
+
+def reward_send(obj):
+    token = obj.get("offer")
+    if not isinstance(token, str):
+        raise ValueError("缺少礼物报价，请刷新")
+    with _REWARD_LOCK:
+        offer = _REWARD_OFFERS.pop(token, None)
+    if not offer or offer["expires"] <= time.monotonic():
+        raise ValueError("报价已使用或过期，请刷新后重新确认")
+    st = cur_station()
+    if (st["id"], str(st["mid"]), str(st["room"])) != (offer["station"], offer["anchor"], offer["configured_room"]):
+        raise ValueError("目标房间已变更，请重新确认")
+    session, csrf = load_credentials()
+    if session != offer["session"] or not csrf:
+        raise ValueError("登录账号已变更，请刷新后重新确认")
+    item = next((i for i in offer["items"] if i["id"] == obj.get("id")), None)
+    if not item:
+        raise ValueError("所选礼物或档位不在当前报价中")
+    room = offer["room"]
+    form = dict(platform="pc", csrf=csrf, csrf_token=csrf)
+    if offer["kind"] == "gift":
+        path = "/xlive/revenue/v1/gift/sendGold"
+        form.update(uid=offer["uid"], ruid=offer["anchor"], gift_id=item["id"], gift_num=1,
+                    price=item["gold"], coin_type="gold", biz_id=room, biz_code="live", bag_id=0,
+                    send_ruid=0, storm_beat_id=0, rnd=int(time.time()), visit_id="")
+    else:
+        message = obj.get("message")
+        if not isinstance(message, str) or not message.strip():
+            raise ValueError("请输入 SC 留言")
+        if len(message.encode("utf-16-le")) // 2 > item["limit"]:
+            raise ValueError("SC 留言超过当前档位的字数限制")
+        path = "/xlive/revenue/v1/order/createOrder"
+        extra = dict(msg=message, level=item["level"], trans_key="", biz_id=item["id"], sc_image_id=0)
+        form.update(context_id=room, context_type=1, ruid=offer["anchor"], goods_id=item["goods"],
+                    goods_num=1, pay_gold=item["gold"], biz_extra=json.dumps(extra, ensure_ascii=False))
+    connection = http.client.HTTPSConnection("api.live.bilibili.com", timeout=15)
+    try:
+        connection.request("POST", path, urllib.parse.urlencode(form), {
+            "User-Agent": UA, "Origin": "https://live.bilibili.com", "Referer": "https://live.bilibili.com/" + room,
+            "Content-Type": "application/x-www-form-urlencoded", "Cookie": "SESSDATA=%s; bili_jct=%s" % (session, csrf)})
+        response = connection.getresponse()
+        if response.status != 200:
+            raise OSError("HTTP %s" % response.status)
+        result = json.load(response)
+        if type(result.get("code")) is not int:
+            raise ValueError("返回格式异常")
+    except Exception:
+        raise ValueError("付款结果未确认，请先查看 B 站消费记录") from None
+    finally:
+        connection.close()
+    if result["code"] != 0:
+        raise ValueError(result.get("message") or result.get("msg") or "B 站拒绝了此次发送")
+    if offer["kind"] == "sc":
+        order = result.get("data") or {}
+        if order.get("status") == 12:
+            raise ValueError("B 站返回支付失败")
+        if not order.get("order_id"):
+            raise ValueError("SC 订单状态未确认，请查看 B 站消费记录")
+        return {"result": "SC 订单已提交，订单号 %s" % order["order_id"]}
+    return {"result": "已送出 " + item["name"]}
+
+
 def api_live_send(obj):
     msg = str(obj.get("msg") or "").strip()
     if not msg:
@@ -8822,6 +8957,16 @@ class Handler(SimpleHTTPRequestHandler):
         use_station(station)
         if station and parsed.path in ("/api/live/send", "/api/live/wheel/start") and _CUR.station is None:
             return self._json(404, {"error": "弹幕目标主播已移除，请重新选择房间"})
+        reward = parsed.path in ("/api/live/rewards/catalog", "/api/live/rewards/send")
+        if reward:
+            hosts = {"%s:%d" % (h, self.server.server_port) for h in ("localhost", "127.0.0.1")}
+            host = self.headers.get("Host", "")
+            if host not in hosts or self.headers.get("Origin") != "http://" + host:
+                return self._json(403, {"error": "请从本机直播间打开礼物面板"})
+            if self.headers.get_content_type() != "application/json":
+                return self._json(415, {"error": "礼物请求需要 JSON"})
+            if not station or _CUR.station is None:
+                return self._json(404, {"error": "目标主播已移除，请重新选择房间"})
         if empty_state(parsed.path):
             return self._json(200, {"ok": True, "empty": True})
         try:
@@ -8836,6 +8981,15 @@ class Handler(SimpleHTTPRequestHandler):
         if not isinstance(obj, dict):
             return self._json(400, {"error": "请求体必须是 JSON 对象"})
 
+        if reward:
+            try:
+                if parsed.path.endswith("/catalog"):
+                    return self._json(200, reward_catalog(obj.get("kind")))
+                return self._json(200, reward_send(obj))
+            except ValueError as exc:
+                return self._json(400, {"error": str(exc)})
+            except Exception:
+                return self._json(502, {"error": "直播礼物服务暂时不可用，请稍后查看"})
         if parsed.path == "/api/playlist/import":
             return self._json(*api_playlist_import(obj))
         if parsed.path == "/api/playlist/like":
@@ -8938,6 +9092,7 @@ class Handler(SimpleHTTPRequestHandler):
         # 页面仍会显示旧数据。/api/img 自带长缓存（缩略图内容不变）故不覆盖。
         if not (self.path or "").startswith("/api/img"):
             self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Frame-Options", "SAMEORIGIN")
         super().end_headers()
 
 

@@ -2793,6 +2793,13 @@ body.view-broadcast .col-right:has(#broadcast-grid:not([hidden])) { align-self: 
 body.view-broadcast.broadcast-chat-hidden .wrap { grid-template-columns: minmax(0, 1fr); }
 body.view-broadcast.broadcast-chat-hidden #view-broadcast { display: none; }
 body.view-broadcast.broadcast-chat-hidden .col-right { grid-column: 1; }
+body.view-broadcast .reward-card { flex: 0 0 auto; }
+#reward-panel:not([hidden]) { display: grid; gap: 8px; margin-top: 8px; }
+#reward-panel select, #reward-panel textarea { width: 100%; min-width: 0; }
+#reward-panel textarea { min-height: 3.5em; }
+.reward-row { display: flex; align-items: center; gap: 8px; }
+.reward-row button { flex-shrink: 0; }
+#reward-receipt:empty { display: none; }
 #broadcast-target select { max-width: 100%; }
 body.view-broadcast .views,
 body.view-broadcast.theater .views { display: contents; }   /* section 直接落进 .wrap 网格 */

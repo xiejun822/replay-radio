@@ -2966,13 +2966,92 @@
     saveFreeRects(broadcastGrid, broadcastRects, 'xl_broadcast_rects');
   });
 
+  var rewardMode = document.getElementById('reward-mode');
+  var rewardPanel = document.getElementById('reward-panel');
+  var rewardKind = document.getElementById('reward-kind');
+  var rewardItems = document.getElementById('reward-items');
+  var rewardText = document.getElementById('reward-text');
+  var rewardSend = document.getElementById('reward-send');
+  var rewardNote = document.getElementById('reward-note');
+  var rewardReceipt = document.getElementById('reward-receipt');
+  var rewardOffer = null, rewardGeneration = 0, rewardSending = false;
+
+  function refreshRewards() {
+    var generation = ++rewardGeneration;
+    rewardPanel.hidden = rewardMode.value !== 'paid';
+    rewardOffer = null;
+    rewardItems.replaceChildren();
+    rewardSend.disabled = true;
+    rewardText.hidden = rewardKind.value !== 'sc';
+    if (rewardPanel.hidden || state.view !== 'broadcast') return;
+    var station = broadcastStation || MAIN_ID;
+    if (!station) { rewardNote.textContent = '请选择主播'; return; }
+    rewardNote.textContent = '正在读取房间与价格…';
+    postJSON('/api/live/rewards/catalog?station=' + encodeURIComponent(station), {kind: rewardKind.value})
+      .then(function (data) {
+        if (generation !== rewardGeneration) return;
+        if (!data.items || !data.items.length) throw new Error(data.error || '没有可选项目');
+        data.station = station;
+        rewardOffer = data;
+        data.items.forEach(function (item) {
+          rewardItems.add(new Option(item.name + ' · ' + (item.gold / 100) + ' 电池', String(item.id)));
+        });
+        rewardNote.textContent = data.name + ' · 房间 ' + data.room;
+        rewardItems.onchange();
+      }).catch(function (e) {
+        if (generation === rewardGeneration) rewardNote.textContent = e.message;
+      });
+  }
+
+  rewardItems.onchange = function () {
+    if (!rewardOffer) return;
+    var item = rewardOffer.items[rewardItems.selectedIndex];
+    if (!item) return;
+    if (item.limit) rewardText.maxLength = item.limit;
+    rewardSend.disabled = rewardSending;
+  };
+  rewardMode.onchange = refreshRewards;
+  rewardKind.onchange = refreshRewards;
+  document.getElementById('reward-refresh').onclick = refreshRewards;
+  rewardSend.onclick = function () {
+    var offer = rewardOffer;
+    if (!offer || rewardSending) return;
+    var item = offer.items[rewardItems.selectedIndex];
+    var sc = rewardKind.value === 'sc';
+    var msg = sc ? rewardText.value.trim() : '';
+    if (sc && (!msg || msg.length > item.limit)) {
+      rewardNote.textContent = '请输入 1 至 ' + item.limit + ' 字的 SC 留言';
+      return;
+    }
+    var details = offer.name + '（房间 ' + offer.room + '）\n' + item.name
+      + (sc ? '：' + msg : ' × 1') + '\n合计 ' + (item.gold / 100) + ' 电池';
+    if (!window.confirm(details + '\n确认使用当前 B 站账号余额发送？')) return;
+    rewardSending = true;
+    rewardSend.disabled = true;
+    rewardReceipt.textContent = '正在向 ' + offer.name + ' 提交…';
+    var generation = rewardGeneration;
+    postJSON('/api/live/rewards/send?station=' + encodeURIComponent(offer.station),
+      {offer: offer.offer, id: item.id, message: msg}).then(function (data) {
+        rewardReceipt.textContent = offer.name + ' · ' + (data.result || data.error || '请核对消费记录');
+        if (data.result && sc && generation === rewardGeneration && rewardText.value.trim() === msg) rewardText.value = '';
+      }).catch(function () {
+        rewardReceipt.textContent = offer.name + ' · 结果未确认，请先查看 B 站消费记录';
+      }).then(function () {
+        rewardSending = false;
+        if (generation === rewardGeneration) refreshRewards();
+        else if (rewardOffer) rewardItems.onchange();
+      });
+  };
+
   function broadcastUrl(path) {
     return path + (path.indexOf('?') < 0 ? '?' : '&') + 'station=' + encodeURIComponent(broadcastStation);
   }
 
   function selectBroadcastChat(s) {
     chatStop();
+    if (broadcastStation !== s.id) rewardText.value = "";
     broadcastStation = s.id;
+    refreshRewards();
     broadcastSelect.value = s.id;
     el.liveResult.textContent = '';
     el.liveMsg.value = '';
@@ -2988,6 +3067,8 @@
 
   function clearBroadcastGrid() {
     broadcastGeneration++;
+    rewardGeneration++;
+    rewardOffer = null;
     if (!broadcastGrid.hidden) {
       broadcastGrid.replaceChildren();
       multiTeardown();
@@ -3086,7 +3167,7 @@
     el.banner.hidden = true;
     document.getElementById('live-send-card').hidden = ST_SET.length > 1;
     if (ST_SET.length > 1) showBroadcastGrid(broadcastGeneration);
-    else loadLiveInfo();
+    else { loadLiveInfo(); refreshRewards(); }
     refreshLiveCred();
     pollWheel();
     if (!wheelTimer) wheelTimer = setInterval(pollWheel, 1000);

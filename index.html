@@ -485,6 +485,22 @@ window.__BOOT_T0 = Date.now();
         <div class="live-info" id="live-info">正在获取开播状态…</div>
       </div>
 
+      <div class="live-card reward-card">
+        <label>互动模式 <select id="reward-mode">
+          <option value="watch">观看模式</option><option value="paid">礼物与 SC 模式</option>
+        </select></label>
+        <div id="reward-panel" hidden>
+          <div class="reward-row"><select id="reward-kind" aria-label="互动类型">
+            <option value="gift">电池礼物</option><option value="sc">醒目留言（SC）</option>
+          </select><button type="button" class="btn small ghost" id="reward-refresh">刷新价格</button></div>
+          <select id="reward-items" aria-label="礼物或 SC 档位"></select>
+          <textarea id="reward-text" aria-label="SC 留言" placeholder="写下醒目留言" hidden></textarea>
+          <div id="reward-note" class="live-note" role="status"></div>
+          <button type="button" class="btn small primary" id="reward-send" disabled>核对并发送</button>
+          <div id="reward-receipt" class="live-note" role="status"></div>
+        </div>
+      </div>
+
       <div class="live-card live-chat-card">
         <div class="live-card-h">实时弹幕<span class="live-wheel-note" id="live-chat-state"></span></div>
         <div class="live-chat" id="live-chat">

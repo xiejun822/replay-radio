@@ -2904,6 +2904,34 @@
   var broadcastGrid = document.getElementById('broadcast-grid');
   var broadcastSelect = document.getElementById('broadcast-station');
 
+  var broadcastLayout = document.getElementById('broadcast-layout');
+  var broadcastRects = store.get('xl_broadcast_rects', {});
+  if (!broadcastRects || typeof broadcastRects !== 'object') broadcastRects = {};
+  broadcastLayout.value = store.get('xl_broadcast_layout') === 'free' ? 'free' : 'auto';
+
+  function arrangeBroadcast() {
+    var free = broadcastLayout.value === 'free';
+    broadcastGrid.classList.toggle('multi-grid', free);
+    broadcastGrid.classList.toggle('free', free);
+    var cells = broadcastGrid.querySelectorAll('article');
+    cells.forEach(function (cell, i) {
+      if (!free) { cell.removeAttribute('style'); return; }
+      var rect = freeRectFor(broadcastRects, cell.dataset.id, i, cells.length);
+      cell.style.left = rect.x + '%';
+      cell.style.top = rect.y + '%';
+      cell.style.width = rect.w + '%';
+      cell.style.height = rect.h + '%';
+    });
+  }
+
+  broadcastLayout.onchange = function () {
+    store.set('xl_broadcast_layout', broadcastLayout.value);
+    arrangeBroadcast();
+  };
+  bindFreeDrag(broadcastGrid, function () {
+    saveFreeRects(broadcastGrid, broadcastRects, 'xl_broadcast_rects');
+  });
+
   function broadcastUrl(path) {
     return path + (path.indexOf('?') < 0 ? '?' : '&') + 'station=' + encodeURIComponent(broadcastStation);
   }
@@ -2953,12 +2981,12 @@
         broadcastSelect.add(new Option(name, s.id));
         var cell = document.createElement('article');
         cell.dataset.id = s.id;
-        cell.innerHTML = '<video muted playsinline controls></video><header>'
+        cell.innerHTML = '<video muted playsinline controls></video><header><span class="broadcast-grip" title="拖动调整位置">⠿</span>'
           + '<button type="button" class="btn small ghost" data-chat="' + esc(s.id)
           + '" title="切换到这个房间的弹幕">' + esc(name) + '</button>'
           + '<select class="ms-qn" aria-label="直播画质"></select>'
           + '<button type="button" class="btn small ghost" data-retry>重连</button>'
-          + '<span data-role="state">正在获取开播状态…</span></header>';
+          + '<span data-role="state">正在获取开播状态…</span></header>' + msHandlesHtml();
         broadcastGrid.appendChild(cell);
         cell.querySelector('[data-chat]').onclick = function () { selectBroadcastChat(s); };
         cell.querySelector('[data-retry]').onclick = function () { multiRestartCell(cell); };
@@ -2968,6 +2996,7 @@
         };
         startMultiCell(s, cell, { view: 'broadcast' });
       });
+      arrangeBroadcast();
       broadcastSelect.onchange = function () {
         selectBroadcastChat(rooms[broadcastSelect.selectedIndex]);
       };
@@ -3284,14 +3313,14 @@
     // 必须自己带上 station：stq() 包装的是 window.fetch，管不到 EventSource。
     // 不带的话副站的直播间会订阅到**主站**的弹幕（主站没播就是空面板）。
     chatEs = new EventSource(broadcastUrl('/api/live/chat/stream'));
-    chatEs.onopen = function () { el.liveChatState.textContent = '已连接 · 实时弹幕中'; };
+    chatEs.onopen = function () { el.liveChatState.textContent = '等待弹幕网关确认…'; };
     chatEs.onmessage = function (ev) {
       var j;
       try { j = JSON.parse(ev.data); } catch (e) { return; }
       if (j.type === 'danmaku') chatLine(j.uid, j.uname, j.text);
       else if (j.type === 'popularity')
         el.liveChatState.textContent = '已连接 · 人气 ' + fmtNum(j.value);
-      else if (j.type === 'state') chatSys(j.text);
+      else if (j.type === 'state') el.liveChatState.textContent = j.text;
     };
     // EventSource 自己会重连，这里只更新提示
     chatEs.onerror = function () { el.liveChatState.textContent = '已断开，重连中…'; };
@@ -9703,6 +9732,7 @@
         return;
       }
       if (Date.now() - lastProgress < 12000) return;
+      if (!cell._p) return;
       if (video.paused && view === 'broadcast' && video.readyState >= 2) return;
       if (video.paused) {                            // 被浏览器挂起：先叫一次 play()
         try {
@@ -9896,6 +9926,72 @@
     });
   }
 
+  function bindFreeDrag(grid, onDrop) {
+    grid.addEventListener('pointerdown', function (e) {
+      if (!grid.classList.contains('free') || e.button !== 0) return;
+      var cell = e.target.closest ? e.target.closest('[data-id]') : null;
+      if (!cell) return;
+      if (e.target.closest('button, select, input') || (grid === broadcastGrid && e.target.closest('video'))) return;
+      var hd = (e.target.getAttribute && e.target.getAttribute('data-hd')) || '';
+      e.preventDefault();
+      var box = grid.getBoundingClientRect();
+      var sx = e.clientX, sy = e.clientY;
+      var movedPx = false;
+      var r = {
+        x: parseFloat(cell.style.left) || 0, y: parseFloat(cell.style.top) || 0,
+        w: parseFloat(cell.style.width) || FREE_MIN_W,
+        h: parseFloat(cell.style.height) || FREE_MIN_H
+      };
+      multiFreeZ += 1;
+      cell.style.zIndex = String(20 + (multiFreeZ % 30));   // 正在拖的那张浮到最上面
+      cell.classList.add('dragging');
+
+      var pointerId = e.pointerId;
+      function moveTo(ev) {
+        if (ev.pointerId !== pointerId) return;
+        movedPx = true;
+        var dx = (ev.clientX - sx) / box.width * 100;
+        var dy = (ev.clientY - sy) / box.height * 100;
+        var x = r.x, y = r.y, w = r.w, h = r.h;
+        if (hd) {
+          // 捏的是哪条边就改哪条：改左边/上边时要连带挪 x/y，右边/下边不动它
+          var right = r.x + r.w, bottom = r.y + r.h;
+          if (hd.indexOf('e') >= 0) {
+            w = Math.min(100 - r.x, Math.max(FREE_MIN_W, r.w + dx));
+          } else if (hd.indexOf('w') >= 0) {
+            x = Math.min(right - FREE_MIN_W, Math.max(0, r.x + dx));
+            w = right - x;
+          }
+          if (hd.indexOf('s') >= 0) {
+            h = Math.min(100 - r.y, Math.max(FREE_MIN_H, r.h + dy));
+          } else if (hd.indexOf('n') >= 0) {
+            y = Math.min(bottom - FREE_MIN_H, Math.max(0, r.y + dy));
+            h = bottom - y;
+          }
+        } else {
+          x = Math.min(100 - w, Math.max(0, r.x + dx));
+          y = Math.min(100 - h, Math.max(0, r.y + dy));
+        }
+        cell.style.left = x + '%';
+        cell.style.top = y + '%';
+        cell.style.width = w + '%';
+        cell.style.height = h + '%';
+      }
+
+      function stop(ev) {
+        if (ev.pointerId !== pointerId) return;
+        window.removeEventListener('pointermove', moveTo);
+        window.removeEventListener('pointerup', stop);
+        window.removeEventListener('pointercancel', stop);
+        cell.classList.remove('dragging');
+        if (movedPx) onDrop();
+      }
+      window.addEventListener('pointermove', moveTo);
+      window.addEventListener('pointerup', stop);
+      window.addEventListener('pointercancel', stop);
+    });
+  }
+
   function bindMulti() {
     bindHiddenBar();
     var grid = document.getElementById('multi-grid');
@@ -9947,64 +10043,9 @@
     /* 自由布局：按住卡片任意位置拖动，捏住四周（四边或四角）缩放。
        底栏上的按钮/滑杆/下拉照常能点（pointerdown 里先把控件排除掉，否则一按按钮就开始拖）。
        位置尺寸都是画布的百分比，拖完写回记忆。 */
-    grid.addEventListener('pointerdown', function (e) {
-      if (multiLayout !== 'free') return;
-      var cell = e.target.closest ? e.target.closest('.ms-cell') : null;
-      if (!cell) return;
-      if (e.target.closest('.ms-btn, .ms-qn, .ms-vol, .ms-min')) return;
-      var hd = (e.target.getAttribute && e.target.getAttribute('data-hd')) || '';
-      e.preventDefault();
-      var box = grid.getBoundingClientRect();
-      var sx = e.clientX, sy = e.clientY;
-      var movedPx = false;
-      var r = {
-        x: parseFloat(cell.style.left) || 0, y: parseFloat(cell.style.top) || 0,
-        w: parseFloat(cell.style.width) || FREE_MIN_W,
-        h: parseFloat(cell.style.height) || FREE_MIN_H
-      };
-      multiFreeZ += 1;
-      cell.style.zIndex = String(20 + (multiFreeZ % 30));   // 正在拖的那张浮到最上面
-      cell.classList.add('dragging');
-
-      function moveTo(ev) {
-        movedPx = true;
-        var dx = (ev.clientX - sx) / box.width * 100;
-        var dy = (ev.clientY - sy) / box.height * 100;
-        var x = r.x, y = r.y, w = r.w, h = r.h;
-        if (hd) {
-          // 捏的是哪条边就改哪条：改左边/上边时要连带挪 x/y，右边/下边不动它
-          var right = r.x + r.w, bottom = r.y + r.h;
-          if (hd.indexOf('e') >= 0) {
-            w = Math.min(100 - r.x, Math.max(FREE_MIN_W, r.w + dx));
-          } else if (hd.indexOf('w') >= 0) {
-            x = Math.min(right - FREE_MIN_W, Math.max(0, r.x + dx));
-            w = right - x;
-          }
-          if (hd.indexOf('s') >= 0) {
-            h = Math.min(100 - r.y, Math.max(FREE_MIN_H, r.h + dy));
-          } else if (hd.indexOf('n') >= 0) {
-            y = Math.min(bottom - FREE_MIN_H, Math.max(0, r.y + dy));
-            h = bottom - y;
-          }
-        } else {
-          x = Math.min(100 - w, Math.max(0, r.x + dx));
-          y = Math.min(100 - h, Math.max(0, r.y + dy));
-        }
-        cell.style.left = x + '%';
-        cell.style.top = y + '%';
-        cell.style.width = w + '%';
-        cell.style.height = h + '%';
-      }
-
-      function stop() {
-        window.removeEventListener('pointermove', moveTo);
-        window.removeEventListener('pointerup', stop);
-        cell.classList.remove('dragging');
-        saveFreeRects(grid);
-        if (movedPx) dragEndAt = Date.now();
-      }
-      window.addEventListener('pointermove', moveTo);
-      window.addEventListener('pointerup', stop);
+    bindFreeDrag(grid, function () {
+      saveFreeRects(grid, multiFreeRects, 'xl_mf_rects');
+      dragEndAt = Date.now();
     });
     /* 非自由布局：整格按住就能拖，松手与目标格**互换位置**（顺序记在 localStorage）。
        6px 阈值 —— 否则「点独奏 / 放大 / 拉音量」这些点击会被当成拖动吃掉。
@@ -10272,9 +10313,11 @@
 
   /* 自由布局里每格的位置尺寸，单位是画布的百分比 —— 窗口变了也等比跟着走。
      没有记忆时先按自动排布给个初始值，用户拖过之后就一直是拖好的那个。 */
-  function freeRectFor(id, idx, n) {
-    var r = multiFreeRects[id];
-    if (r && typeof r.x === 'number') return r;
+  function freeRectFor(rects, id, idx, n) {
+    var r = rects[id];
+    if (r && [r.x, r.y, r.w, r.h].every(Number.isFinite)
+        && r.x >= 0 && r.y >= 0 && r.w > 0 && r.h > 0
+        && r.x + r.w <= 100.01 && r.y + r.h <= 100.01) return r;
     var cols = multiCols(n), rows = Math.ceil(n / cols), gap = 1.2;
     return {
       x: (idx % cols) * (100 / cols) + gap / 2,
@@ -10284,17 +10327,17 @@
     };
   }
 
-  function saveFreeRects(grid) {
-    Array.prototype.forEach.call(grid.querySelectorAll('.ms-cell'), function (c) {
+  function saveFreeRects(grid, rects, key) {
+    Array.prototype.forEach.call(grid.querySelectorAll('[data-id]'), function (c) {
       var id = c.getAttribute('data-id');
       if (!id || !c.style.left) return;      // 被最小化的没有内联位置，别覆盖它的记忆
-      multiFreeRects[id] = {
+      rects[id] = {
         x: parseFloat(c.style.left) || 0, y: parseFloat(c.style.top) || 0,
         w: parseFloat(c.style.width) || FREE_MIN_W,
         h: parseFloat(c.style.height) || FREE_MIN_H
       };
     });
-    store.set('xl_mf_rects', multiFreeRects);
+    store.set(key, rects);
   }
 
   /* 选网格：按「单格能铺多大」挑，而不是按「墙的宽高比像不像 16:9」。
@@ -10643,7 +10686,7 @@
 
     if (multiLayout === 'free') {
       for (i = 0; i < cells.length; i++) {
-        var box = freeRectFor(cells[i].getAttribute('data-id'), i, n);
+        var box = freeRectFor(multiFreeRects, cells[i].getAttribute('data-id'), i, n);
         cells[i].style.left = box.x + '%';
         cells[i].style.top = box.y + '%';
         cells[i].style.width = box.w + '%';

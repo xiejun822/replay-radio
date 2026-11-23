@@ -2900,7 +2900,7 @@ def _rc_dm_worker(room, path, start_ts, stop, entry):
                 sock = _ws_handshake(host, port, "/sub", {
                     "Origin": "https://live.bilibili.com", "User-Agent": UA, "Cookie": ck})
                 _ws_send(sock, _bili_pack(json.dumps({
-                    "uid": self_uid(), "roomid": int(room), "proto_ver": 2,
+                    "uid": self_uid(), "roomid": int(room), "protover": 2,
                     "buvid": bili_buvid3(), "platform": "web", "clientver": "1.14.3",
                     "type": 2, "key": info["token"]}).encode(), 7))
                 entry["err"] = ""
@@ -6701,21 +6701,12 @@ def chat_state(sid=None):
                 "error": "", "logged_err": ""}}
             CHAT[sid] = st
         return st
-_UID = [None]
+
 
 
 def self_uid():
-    """弹幕认证里的 uid。有登录态时用真实 uid —— 用 0 会被网关直接关闭连接。"""
-    if _UID[0] is None:
-        try:
-            d = bili_get("https://api.bilibili.com/x/web-interface/nav")
-            _UID[0] = int(((d.get("data") or {}).get("mid") or 0))
-        except Exception:
-            # 取失败**不能**缓存：缓存 0 会把它钉死，之后每次连接都用 0 去认证，
-            # 网关直接关连接 —— 表现为弹幕永远连不上，只能重启。未登录时接口
-            # 返回的 mid 本来就是 0，那种「确定没登录」才值得缓存。
-            return 0
-    return _UID[0]
+    """复用随登录、登出失效的账号状态，避免沿用上一位用户或匿名 UID。"""
+    return int(api_status()[1].get("mid") or 0)
 
 
 # buvid3 用下方「主播动态」段的 bili_buvid3()。这里原本**另写了一份**缓存
@@ -6799,43 +6790,30 @@ def _chat_broadcast(sid, item):
 
 
 def _chat_parse(sid, data):
+    """消费网关数据包，返回本帧是否含认证成功回执。"""
     off = 0
+    authenticated = False
     while off + 16 <= len(data):
-        ln = struct.unpack(">I", data[off:off + 4])[0]
-        if ln < 16 or off + ln > len(data):
-            return
-        ver = struct.unpack(">H", data[off + 6:off + 8])[0]
-        op = struct.unpack(">I", data[off + 8:off + 12])[0]
-        body = data[off + 16:off + ln]
-        if op == 3 and len(body) >= 4:
-            pop = struct.unpack(">I", body[:4])[0]
+        length, header, version, op, _ = struct.unpack_from(">IHHII", data, off)
+        if header < 16 or length < header or off + length > len(data):
+            raise ValueError("弹幕数据包长度错误")
+        body = data[off + header:off + length]
+        off += length
+        if op == 8:
+            code = json.loads(body).get("code")
+            if code != 0:
+                raise RuntimeError("弹幕认证失败，返回码 %s" % code)
+            authenticated = True
+            _chat_broadcast(sid, {"type": "state", "text": "已连接 · 实时弹幕中"})
+        elif op == 3 and len(body) >= 4:
+            pop = struct.unpack_from(">I", body)[0]
             chat_state(sid)["worker"]["popularity"] = pop
             _chat_broadcast(sid, {"type": "popularity", "value": pop})
-        elif op == 5:
-            payload = body
-            if ver == 2:
-                try:
-                    payload = zlib.decompress(body)
-                except Exception:
-                    payload = b""
-            elif ver == 3:
-                payload = b""            # brotli：本服务只请求 ver2，出现即忽略
-            if payload:
-                _chat_parse_nested(sid, payload)
-        off += ln
-
-
-def _chat_parse_nested(sid, payload):
-    off = 0
-    while off + 16 <= len(payload):
-        ln = struct.unpack(">I", payload[off:off + 4])[0]
-        if ln < 16 or off + ln > len(payload):
-            return
-        ver = struct.unpack(">H", payload[off + 6:off + 8])[0]
-        op = struct.unpack(">I", payload[off + 8:off + 12])[0]
-        if op == 5 and ver == 0:
+        elif op == 5 and version == 2:
+            _chat_parse(sid, zlib.decompress(body))
+        elif op == 5 and version in (0, 1):
             try:
-                j = json.loads(payload[off + 16:off + ln].decode("utf-8", "replace"))
+                j = json.loads(body.decode("utf-8", "replace"))
                 cmd = str(j.get("cmd") or "")
                 # B 站主动推的开播/下播：拿到就记下来，供 /api/status/board 直接使用
                 if cmd in ("LIVE", "PREPARING"):
@@ -6851,7 +6829,7 @@ def _chat_parse_nested(sid, payload):
                                           "uname": who[1] or "", "text": info[1] or ""})
             except Exception:
                 pass
-        off += ln
+    return authenticated
 
 
 def _chat_worker(sid):
@@ -6867,7 +6845,7 @@ def _chat_worker(sid):
             try:
                 info = api_live_danmu_info()[1]
                 if not info.get("hosts") or not info.get("token"):
-                    raise RuntimeError("没取到弹幕网关信息")
+                    raise RuntimeError(info.get("error") or "没取到弹幕网关信息")
                 host = info["hosts"][0]["host"]
                 port = info["hosts"][0]["wss_port"] or 443
                 sess = load_credentials()[0]
@@ -6876,9 +6854,8 @@ def _chat_worker(sid):
                     ck = "SESSDATA=%s; %s" % (sess, ck)
                 sock = _ws_handshake(host, port, "/sub", {
                     "Origin": "https://live.bilibili.com", "User-Agent": UA, "Cookie": ck})
-                st["worker"]["logged_err"] = ""      # 连上了：下次失败照常记日志
                 _ws_send(sock, _bili_pack(json.dumps({
-                    "uid": self_uid(), "roomid": int(cur_room()), "proto_ver": 2,
+                    "uid": self_uid(), "roomid": int(cur_room()), "protover": 2,
                     "buvid": bili_buvid3(), "platform": "web", "clientver": "1.14.3",
                     "type": 2, "key": info["token"]}).encode(), 7))
                 last_hb = time.time()
@@ -6896,7 +6873,10 @@ def _chat_worker(sid):
                     if opcode is None:
                         raise RuntimeError("网关关闭了连接")
                     if opcode == 2:
-                        _chat_parse(sid, data)
+                        if _chat_parse(sid, data):
+                            st["worker"].update(logged_err="", error="")
+                            _ws_send(sock, _bili_pack(b"", 2))
+                            last_hb = time.time()
                     elif opcode == 9:
                         _ws_send(sock, data, opcode=10)
                     elif opcode == 8:
@@ -6909,7 +6889,7 @@ def _chat_worker(sid):
                 if st["worker"]["error"] != st["worker"]["logged_err"]:
                     st["worker"]["logged_err"] = st["worker"]["error"]
                     print("[chat] %s 弹幕连接失败：%s" % (sid, st["worker"]["error"]))
-                _chat_broadcast(sid, {"type": "state", "text": "弹幕连接中断，正在重试…"})
+                _chat_broadcast(sid, {"type": "state", "text": "%s，正在重连…" % e})
             finally:
                 if sock:
                     try:

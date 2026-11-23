@@ -2799,6 +2799,15 @@ body.view-broadcast .col-right:has(#broadcast-grid:not([hidden])) {
 #broadcast-grid header { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
 #broadcast-grid [aria-pressed="true"] { color: var(--red); }
 #broadcast-grid [data-role="state"] { color: var(--muted); font-size: 12px; }
+#broadcast-target:not([hidden]) { display: flex; flex-wrap: wrap; gap: 8px; }
+#broadcast-grid.free:not([hidden]) { display: block; position: relative; height: max(320px, calc(100dvh - var(--topbar-h) - 110px)); }
+#broadcast-grid.free article { position: absolute; display: flex; flex-direction: column; background: var(--panel); overflow: hidden; }
+#broadcast-grid.free video { flex: 1 1 0; min-height: 0; object-fit: contain; }
+#broadcast-grid.free header { cursor: move; touch-action: none; padding: 4px 8px; }
+#broadcast-grid .broadcast-grip { display: none; }
+#broadcast-grid.free .broadcast-grip { display: inline; cursor: grab; }
+#broadcast-grid.free .ms-h { touch-action: none; }
+#broadcast-grid [data-chat][aria-pressed="true"] { background: var(--red); color: var(--on-red, #161616); }
 #broadcast-target select { max-width: 100%; }
 body.view-broadcast .views,
 body.view-broadcast.theater .views { display: contents; }   /* section 直接落进 .wrap 网格 */

@@ -8725,10 +8725,7 @@
 
     function pickStation(id) {
       if (!id) return;
-      // 主推放在首位，保留仍在名单里的其他亮灯及其顺序。
-      ST_SET = [id].concat(ST_SET.filter(function (other, index, saved) {
-        return other !== id && saved.indexOf(other) === index && findStation(other);
-      }));
+      ST_SET = [id];
       ST = id;
       saveStations();               // 记住选择（localStorage xl_stations）
       enter();

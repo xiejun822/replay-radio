@@ -7531,6 +7531,10 @@ def _seg_module():
 def seg_ffmpeg():
     """找一次 ffmpeg 并缓存（查不到时会遍历目录，别每次请求都做）。"""
     if SEG_JOB["ffmpeg"] is None:
+        configured = os.environ.get("FFMPEG")
+        if configured and os.path.isfile(configured):
+            SEG_JOB["ffmpeg"] = configured
+            return configured
         try:
             SEG_JOB["ffmpeg"] = _seg_module().find_ffmpeg() or ""
         except Exception:

@@ -1,0 +1,3 @@
+[submodule "vendor/songcut-studio"]
+	path = vendor/songcut-studio
+	url = https://github.com/233hjmoon/songcut-studio.git

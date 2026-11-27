@@ -8,7 +8,7 @@ PCM 波形以便分析。FFmpeg 以**独立可执行文件**的形式随程序�
 来源
     https://ffmpeg.org/            （项目主页）
     https://www.gyan.dev/ffmpeg/   （本次分发的 Windows 构建来源）
-    构建：ffmpeg 7.1 essentials_build（静态链接，configure 含 --enable-gpl --enable-version3）
+    本次 Windows 集成包：FFmpeg 9.0.2、FFprobe 9.1，均为 Gyan essentials_build。
 
 许可
     FFmpeg 主体：LGPL v2.1 或更高版本。

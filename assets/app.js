@@ -5522,6 +5522,8 @@
           var key = g.cid + '@' + s.start;
           state.clipMeta[key] = {
             bvid: p.bvid, cid: g.cid, page: g.page,
+            song: kind === 'named' ? mySongs[S.k - 1] : '',
+            artist: (findStation(p._sid || ST || MAIN_ID) || {}).name || '',
             start: s.start, end: s.end, title: p.title, n: n
           };
           if (state.clipSel[key]) cls += ' picked';
@@ -6990,7 +6992,7 @@
       var m = state.clipMeta[k];
       if (!m || !state.clipSel[k]) return;
       items.push({ key: k, bvid: m.bvid, cid: m.cid, start: m.start, end: m.end,
-                   title: m.title, n: m.n });
+                   title: m.title, n: m.n, song: m.song, artist: m.artist });
     });
     items.sort(function (a, b) {
       return (a.start - b.start) || (String(a.cid) < String(b.cid) ? -1 : 1);
@@ -7070,6 +7072,9 @@
         var orient = state.clipCoverOrient[base] || '16x9';
         var pick = +state.clipCoverPick[base] || 0;
         var mp4 = x.path || '';
+        var editor = x.studioId ? '<a class="btn small ghost" target="_blank" rel="noopener" href="/studio?clip='
+          + encodeURIComponent(x.studioId) + '">用歌切制作台打开</a>' : '';
+        if (!cands.length) return '<div class="cc-card"><b>' + esc(base) + '</b> ' + editor + '</div>';
         var dirty = pick > 0 && (!chosen || pick !== chosen.index);
         var head = dirty ? ('已选第 ' + pick + ' 版 · 待确认')
           : (chosen ? ('已确认第 ' + chosen.index + ' 版') : '未选择');
@@ -7089,7 +7094,7 @@
         }
         return '<div class="cc-card" data-base="' + esc(base) + '" data-path="' + esc(mp4) + '">'
           + '<div class="cc-head"><b title="' + esc(base) + '">' + esc(base) + '</b>'
-          + '<span>' + cands.length + ' 版候选 · ' + head + '</span>'
+          + editor + '<span>' + cands.length + ' 版候选 · ' + head + '</span>'
           + '<div class="cc-tabs"><button type="button" data-cc-orient="16x9"'
           + (orient === '16x9' ? ' class="on"' : '') + '>横屏 16:9</button>'
           + '<button type="button" data-cc-orient="3x4"'
@@ -7256,9 +7261,7 @@
       if (noCover.length) msg += '；' + noCover.length + ' 段封面生成失败：'
         + ((noCover[0].covers && noCover[0].covers.error) || '未知原因');
       clipNote(msg);
-      state.clipCovers = ok.filter(function (x) {
-        return x.covers && x.covers.candidates && x.covers.candidates.length;
-      });
+      state.clipCovers = ok;
       renderClipCovers();
     }).catch(function () {
       state.clipBusy = false;

@@ -37,6 +37,8 @@ import shutil
 import socket
 import ssl
 import struct
+import studio as song_studio
+import uuid
 import subprocess
 import sys
 import threading
@@ -1697,6 +1699,9 @@ def _clip_worker(items, outdir):
                 covers = {"error": str(ce)[:200]}
             with CLIP_LOCK:
                 CLIP_JOB["done"].append({"name": name, "path": out, "ok": True,
+                                         "studioId": uuid.uuid4().hex,
+                                         "song": it.get("name") or it.get("song") or base,
+                                         "artist": it.get("artist", ""),
                                          "quality": media.get("id"),
                                          "src": media["kind"],
                                          "srcHeight": media.get("height") or 0,
@@ -1739,6 +1744,8 @@ def api_clip_start(obj):
         if not bvid or not cid or not (b > a):
             continue
         clean.append({"bvid": bvid, "cid": cid, "start": a, "end": b,
+                      "song": str(it.get("song") or "")[:160],
+                      "artist": str(it.get("artist") or "")[:100],
                       "title": str(it.get("title") or ""), "n": it.get("n") or 1,
                       "name": str(it.get("name") or "").strip()[:80]})
     if not clean:
@@ -8750,6 +8757,23 @@ class Handler(SimpleHTTPRequestHandler):
         parsed = urllib.parse.urlparse(self.path)
         # 主播上下文：?station=<id|mid|房间号>，不带则用主站。必须在所有处理之前设置
         q = urllib.parse.parse_qs(parsed.query)
+        if parsed.path == "/studio":
+            clip = None
+            if "clip" in q:
+                with CLIP_LOCK:
+                    clip = next((row for row in CLIP_JOB["done"]
+                                 if row.get("studioId") == q["clip"][0] and row.get("ok")), None)
+                if not clip:
+                    return self._json(404, {"error": "切片记录已过期，可打开制作台后手动导入已保存的 MP4"})
+            try:
+                url = song_studio.open_editor(self.server.server_port, seg_ffmpeg(), page_alive, page_bye, clip)
+            except (OSError, ImportError) as exc:
+                return self._json(503, {"error": "制作台启动失败：" + str(exc)})
+            self.send_response(302)
+            self.send_header("Location", url)
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            return
         station = q.get("station", [""])[0]
         use_station(station)
         if station and parsed.path.startswith("/api/live/") and _CUR.station is None:
@@ -10233,6 +10257,7 @@ def main():
             rc_finalize_all("应用退出")
         except Exception as e:
             print("[recorder] 收尾异常：%s" % e)
+        song_studio.stop()
         tray_stop()
     return 0
 

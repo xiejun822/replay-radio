@@ -287,6 +287,18 @@ def build_exe():
     sys.path.insert(0, os.path.join(ROOT, "tools"))
     from auto_segments import find_ffmpeg          # noqa: E402
     ff = find_ffmpeg()
+    studio_dir = os.path.join(ROOT, "vendor", "songcut-studio")
+    if not os.path.isfile(os.path.join(studio_dir, "server.py")):
+        sys.exit("缺少歌切制作台，请先运行 git submodule update --init")
+    for name in sorted(os.listdir(studio_dir)):
+        if name.endswith((".py", ".js", ".html", ".css", ".json")):
+            args += ["--add-data", os.path.join(studio_dir, name) + os.pathsep + "vendor/songcut-studio"]
+    probe = os.environ.get("FFPROBE") or (os.path.join(os.path.dirname(ff), "ffprobe.exe") if ff else "")
+    if not os.path.isfile(probe):
+        probe = shutil.which("ffprobe")
+    if not ff or not probe:
+        sys.exit("歌切制作台导出需要 ffmpeg 和 ffprobe，请配置 FFMPEG / FFPROBE")
+    args += ["--add-data", probe + os.pathsep + "ffmpeg", "--hidden-import", "secrets"]
     if ff:
         args += ["--add-data", ff + os.pathsep + "ffmpeg"]
         print("打包 FFmpeg：%s（%.0f MB）" % (ff, os.path.getsize(ff) / 1048576))

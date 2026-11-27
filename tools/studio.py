@@ -1,4 +1,5 @@
 """Host the pinned SongCut Studio on a separate loopback origin."""
+import asyncio
 import math
 import os
 import shutil
@@ -15,6 +16,65 @@ _server = None
 _lock = threading.Lock()
 
 
+MEDIA_FORMATS = "mov,mp3,wav,flac,ogg,aac,matroska,webm,avi,aiff"
+
+
+def receive_media(handler, source, ffmpeg):
+    length = handler.headers.get("Content-Length", "")
+    if not length.isdigit() or not 0 < int(length) <= 4 * 1024**3:
+        raise ValueError("素材为空或超过 4 GB")
+    if not ffmpeg:
+        raise ValueError("未找到处理素材所需的 FFmpeg")
+    remaining = int(length)
+    with source.open("wb") as stream:
+        while remaining:
+            block = handler.rfile.read(min(remaining, 1024**2))
+            if not block:
+                raise ValueError("素材传输中断，请重试")
+            stream.write(block)
+            remaining -= len(block)
+
+
+async def identify_sample(sample):
+    from shazamio import Shazam
+    async with Shazam() as client:
+        return await asyncio.wait_for(client.recognize(sample), timeout=20)
+
+
+def recognize_media(handler, ffmpeg, lyrics):
+    if handler.headers.get("Origin") != "http://127.0.0.1:%d" % handler.server.server_port:
+        return handler._send_json(403, {"error": "请从本地歌切制作台发起识别"})
+    try:
+        start = float(handler.headers.get("X-Sample-Start", ""))
+    except ValueError:
+        raise ValueError("取样位置必须是秒数") from None
+    if not math.isfinite(start) or start < 0:
+        raise ValueError("取样位置必须是非负的有限秒数")
+    with tempfile.TemporaryDirectory(prefix="replayradio-identify-") as temp:
+        source = Path(temp) / "source"
+        receive_media(handler, source, ffmpeg)
+        result = subprocess.run([ffmpeg, "-v", "error", "-nostdin", "-protocol_whitelist", "file",
+            "-format_whitelist", MEDIA_FORMATS, "-ss", str(start), "-i", str(source),
+            "-map", "0:a:0", "-t", "12", "-ar", "16000", "-ac", "1", "-f", "flac", "pipe:1"],
+            capture_output=True, timeout=40, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    if result.returncode or not result.stdout:
+        raise ValueError("无法读取该位置的音轨，请检查素材或移动播放位置")
+    try:
+        answer = asyncio.run(identify_sample(result.stdout))
+    except ImportError:
+        return handler._send_json(503, {"error": "缺少 ShazamIO。源码版请安装 shazamio==0.9.0"})
+    except asyncio.TimeoutError:
+        return handler._send_json(504, {"error": "识曲服务超时，请稍后重试"})
+    except Exception as exc:
+        return handler._send_json(502, {"error": "识曲服务请求失败：" + str(exc)[:140]})
+    track = answer.get("track") or {}
+    if not track.get("title"):
+        return handler._send_json(200, {"matched": False})
+    title, artist = track["title"], track.get("subtitle", "")
+    found = lyrics(title, artist)[1] if lyrics else {}
+    return handler._send_json(200, {"matched": True, "title": title, "artist": artist, "lyrics": found})
+
+
 def trim_media(handler, ffmpeg):
     headers = handler.headers
     if headers.get("Origin") != "http://127.0.0.1:%d" % handler.server.server_port:
@@ -29,24 +89,12 @@ def trim_media(handler, ffmpeg):
         raise ValueError("起点和终点必须是秒数") from None
     if not math.isfinite(start) or not math.isfinite(end) or not 0 <= start < end:
         raise ValueError("起点必须大于等于零，终点必须晚于起点")
-    length = headers.get("Content-Length", "")
-    if not length.isdigit() or not 0 < int(length) <= 4 * 1024**3:
-        raise ValueError("素材为空或超过 4 GB")
-    if not ffmpeg:
-        raise ValueError("未找到裁剪所需的 FFmpeg")
     with tempfile.TemporaryDirectory(prefix="replayradio-trim-") as temp:
         source = Path(temp) / "source"
-        remaining = int(length)
-        with source.open("wb") as stream:
-            while remaining:
-                block = handler.rfile.read(min(remaining, 1024**2))
-                if not block:
-                    raise ValueError("素材传输中断，请重新裁剪")
-                stream.write(block)
-                remaining -= len(block)
+        receive_media(handler, source, ffmpeg)
         # Accept self-contained media containers, including MP4 and MP3.
         input_options = ["-protocol_whitelist", "file", "-format_whitelist",
-                         "mov,mp3,wav,flac,ogg,aac,matroska,webm,avi,aiff"]
+                         MEDIA_FORMATS]
         flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
         probe_name = "ffprobe.exe" if os.name == "nt" else "ffprobe"
         probe = Path(ffmpeg).with_name(probe_name)
@@ -89,7 +137,7 @@ def trim_media(handler, ffmpeg):
             shutil.copyfileobj(stream, handler.wfile)
 
 
-def open_editor(main_port, ffmpeg, alive, bye, clip=None):
+def open_editor(main_port, ffmpeg, alive, bye, clip=None, lyrics=None):
     global _server
     with _lock:
         if _server is None:
@@ -105,11 +153,13 @@ def open_editor(main_port, ffmpeg, alive, bye, clip=None):
                     path = urlsplit(self.path).path
                     if path in ("/", "/index.html"):
                         page = (SOURCE / "index.html").read_text(encoding="utf-8")
-                        page = page.replace("</body>", '<script src="/rr/trim.js"></script><script src="/rr/import.js"></script></body>')
+                        page = page.replace("</body>", '<script src="/rr/recognize.js"></script><script src="/rr/trim.js"></script><script src="/rr/import.js"></script></body>')
                         return self.send_bytes(page.encode(), "text/html; charset=utf-8")
                     if path == "/rr/import.js":
                         script = (BASE / "assets" / "studio-import.js").read_bytes()
                         return self.send_bytes(script, "application/javascript")
+                    if path == "/rr/recognize.js":
+                        return self.send_bytes((BASE / "assets" / "studio-recognize.js").read_bytes(), "application/javascript")
                     if path == "/rr/trim.js":
                         return self.send_bytes((BASE / "assets" / "studio-trim.js").read_bytes(), "application/javascript")
                     # Each exported clip gets its own draft; keep the normal editor's draft
@@ -147,15 +197,17 @@ def open_editor(main_port, ffmpeg, alive, bye, clip=None):
                     self.wfile.write(data)
 
                 def do_POST(self):
-                    if self.path == "/rr/trim":
+                    if self.path in ("/rr/trim", "/rr/recognize"):
                         try:
+                            if self.path == "/rr/recognize":
+                                return recognize_media(self, studio.find_ffmpeg(), lyrics)
                             return trim_media(self, studio.find_ffmpeg())
                         except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
                             return
                         except ValueError as exc:
                             return self._send_json(400, {"error": str(exc)})
                         except subprocess.TimeoutExpired:
-                            return self._send_json(504, {"error": "裁剪超时，请缩短选段后重试"})
+                            return self._send_json(504, {"error": "处理素材超时，请换一个位置或较短的素材重试"})
                         except OSError as exc:
                             return self._send_json(500, {"error": "处理素材失败：" + str(exc)})
                     if self.path in ("/rr/alive", "/rr/bye"):

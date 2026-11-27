@@ -8831,7 +8831,7 @@ class Handler(SimpleHTTPRequestHandler):
                 if not clip:
                     return self._json(404, {"error": "切片记录已过期，可打开制作台后手动导入已保存的 MP4"})
             try:
-                url = song_studio.open_editor(self.server.server_port, seg_ffmpeg(), page_alive, page_bye, clip)
+                url = song_studio.open_editor(self.server.server_port, seg_ffmpeg(), page_alive, page_bye, clip, lyrics=api_lyrics)
             except (OSError, ImportError) as exc:
                 return self._json(503, {"error": "制作台启动失败：" + str(exc)})
             self.send_response(302)

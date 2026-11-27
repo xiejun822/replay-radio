@@ -298,6 +298,8 @@ def build_exe():
         probe = shutil.which("ffprobe")
     if not ff or not probe:
         sys.exit("歌切制作台导出需要 ffmpeg 和 ffprobe，请配置 FFMPEG / FFPROBE")
+    import shazamio  # Build dependency: pip install shazamio==0.9.0
+    args += ["--copy-metadata", "shazamio", "--copy-metadata", "shazamio-core"]
     args += ["--add-data", probe + os.pathsep + "ffmpeg", "--hidden-import", "secrets"]
     for module in ("ImageChops", "ImageColor", "ImageDraw", "ImageEnhance", "ImageFilter",
                    "ImageFont", "ImageOps", "ImageSequence"):

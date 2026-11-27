@@ -83,10 +83,14 @@ def open_editor(main_port, ffmpeg, alive, bye, clip=None):
                         return self._send_json(409, {"error": "请关闭制作台标签页，或从 ReplayRadio 停止本地服务"})
                     return super().do_POST()
 
+            class EditorServer(studio.SingleInstanceServer):
+                # Chromium opens several connections while it discovers the editor's scripts.
+                request_queue_size = 128
+
             try:
-                instance = studio.SingleInstanceServer(("127.0.0.1", 18766), Editor)
+                instance = EditorServer(("127.0.0.1", 18766), Editor)
             except OSError:
-                instance = studio.SingleInstanceServer(("127.0.0.1", 0), Editor)
+                instance = EditorServer(("127.0.0.1", 0), Editor)
             instance.clips = {}
             threading.Thread(target=instance.serve_forever, daemon=True).start()
             threading.Thread(target=studio.reap_stale_jobs, daemon=True).start()

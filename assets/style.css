@@ -5408,9 +5408,11 @@ body.view-dd .col-right {
 /* 录播姬：整页全宽。房间卡片 + 文件 + 日志的信息量比播放器重要，
    沿用「右栏 60% 播放器」会把正文压到 400px（房间卡只能排一列）。
    播放器**不卸载**，只缩成 1px —— 与 DD 板块同一套做法，回放不会中断。 */
+body.view-studio .wrap,
 body.view-recorder .wrap {
   grid-template-columns: minmax(0, 1fr);
 }
+body.view-studio .col-right,
 body.view-recorder .col-right {
   position: absolute;
   top: 0; left: 0;
@@ -5422,6 +5424,11 @@ body.view-recorder .col-right {
 }
 
 /* DD 内部子标签（圆角胶囊，选中实心） */
+body.view-studio .views { grid-column: 1 / -1; min-width: 0; }
+body.view-studio .status-dock { display: none; }
+#studio-frame { display: block; width: 100%; height: calc(100dvh - 80px); min-height: 320px; border: 0; }
+#studio-frame[hidden] { display: none; }
+
 .dd-subtabs { display: flex; gap: 8px; margin: 14px 0 0; flex-wrap: wrap; }
 .dd-sub {
   border: 1px solid var(--line-2);

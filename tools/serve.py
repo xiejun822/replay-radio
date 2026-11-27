@@ -1750,15 +1750,16 @@ def api_clip_start(obj):
                       "name": str(it.get("name") or "").strip()[:80]})
     if not clean:
         return 400, {"error": "分段数据不完整"}
+    batch_id = uuid.uuid4().hex
     with CLIP_LOCK:
         if CLIP_JOB.get("running"):
             return 409, {"error": "上一批还在保存，请等它结束"}
-        CLIP_JOB = {"running": True, "idx": 0, "total": len(clean), "current": "",
+        CLIP_JOB = {"batchId": batch_id, "running": True, "idx": 0, "total": len(clean), "current": "",
                     "dir": outdir, "done": [], "error": "", "started": time.time(),
                     "cancel": False}
     t = threading.Thread(target=_clip_worker, args=(clean, outdir), daemon=True)
     t.start()
-    return 200, {"ok": True, "total": len(clean), "dir": outdir}
+    return 200, {"ok": True, "batchId": batch_id, "total": len(clean), "dir": outdir}
 
 
 def api_clip_status():

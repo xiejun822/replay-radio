@@ -5,6 +5,14 @@
 (function () {
   'use strict';
 
+  // 旧版制作台的「返回 ReplayRadio」会在当前框架里打开本站首页。
+  if (window.frameElement && window.frameElement.id === 'studio-frame') {
+    var hostFrame = window.frameElement;
+    window.parent.location.hash = hostFrame.dataset.returnView || '#/live';
+    hostFrame.removeAttribute('src');
+    return;
+  }
+
   var CFG = {
     epoch: Date.parse('2026-09-25T00:00:00+08:00') / 1000,
     seed: 20260925,
@@ -1610,7 +1618,7 @@
   })();
 
   var VIEWS = ['live', 'multi', 'recorder', 'broadcast', 'schedule', 'playlist',
-               'dynamic', 'weibo', 'dd', 'about', 'settings'];
+               'dynamic', 'weibo', 'dd', 'about', 'settings', 'studio'];
   var KEY_MUTED = 'xl_muted';
   var KEY_LOOP = 'xl_loop';         // 循环播放：off / one / list / random（见 state.loop）
   /* 播放进度，按板块分键（`xl_pos_<板块 id>` / `xl_plpos_<板块 id>`）。
@@ -4830,6 +4838,34 @@
        ⚠️ body 上只有这种**特例 class**，没有通用的 view-<name>（踩过一次）。 */
     document.body.classList.toggle('view-dd', name === 'dd');
     document.body.classList.toggle('view-recorder', name === 'recorder');
+    document.body.classList.toggle('view-studio', name === 'studio');
+    if (name === 'studio') {
+      var frame = document.getElementById('studio-frame');
+      if (prev !== 'studio') frame.dataset.returnView = '#/' + (prev || 'live');
+      var clip = new URLSearchParams(location.hash.split('?')[1] || '').get('clip');
+      var source = clip ? '/studio?clip=' + encodeURIComponent(clip) : '/studio';
+      if (frame.getAttribute('src') !== source) {
+        var errorBox = document.getElementById('studio-error');
+        errorBox.hidden = true;
+        frame.hidden = false;
+        frame.onload = function () {
+          // 制作台在另一个本机端口；启动错误或过期切片由本站返回 JSON。
+          var doc = frame.contentDocument;
+          if (!doc || !doc.body || doc.contentType !== 'application/json') return;
+          var pre = doc.querySelector('pre');
+          if (!pre) return;
+          var error = JSON.parse(pre.textContent);
+          errorBox.querySelector('span').textContent = error.error || '歌切制作台加载失败。';
+          errorBox.hidden = false;
+          frame.hidden = true;
+          frame.removeAttribute('src');
+        };
+        frame.setAttribute('src', source);
+      }
+      // 从别的板块点顶栏回来时，继续编辑同一首。
+      document.querySelector('.tab[data-view="studio"]').hash = clip ? '#/studio?clip=' + encodeURIComponent(clip) : '#/studio';
+      hideBootVeil();
+    }
     document.querySelectorAll('.tab').forEach(function (t) {
       t.classList.toggle('active', t.getAttribute('data-view') === name);
     });
@@ -4928,7 +4964,7 @@
   function route() {
     // 没有 hash 时用设置里「启动时打开的板块」（v1.0.35 新增）；没设过仍默认 live。
     // ⚠️ 值非法（比如某个板块以后被删掉）时 setView 里会兜底到 live，不会白屏。
-    setView((location.hash || '').replace(/^#\/?/, '')
+    setView((location.hash || '').split('?')[0].replace(/^#\/?/, '')
             || store.get('xl_default_view', 'live'));
   }
 
@@ -7072,7 +7108,7 @@
         var orient = state.clipCoverOrient[base] || '16x9';
         var pick = +state.clipCoverPick[base] || 0;
         var mp4 = x.path || '';
-        var editor = x.studioId ? '<a class="btn small ghost" target="_blank" rel="noopener" href="/studio?clip='
+        var editor = x.studioId ? '<a class="btn small ghost" href="#/studio?clip='
           + encodeURIComponent(x.studioId) + '">用歌切制作台打开</a>' : '';
         if (!cands.length) return '<div class="cc-card"><b>' + esc(base) + '</b> ' + editor + '</div>';
         var dirty = pick > 0 && (!chosen || pick !== chosen.index);
@@ -7155,6 +7191,9 @@
     if (cnt) cnt.textContent = '已选 ' + clipSelectedCount() + ' 段';
     var save = document.getElementById('clip-save');
     if (save) save.disabled = state.clipBusy || clipSelectedCount() === 0;
+    var studio = document.getElementById('clip-studio');
+    studio.disabled = state.clipBusy;
+    studio.textContent = clipSelectedCount() ? '导入歌切制作台' : '歌切制作台';
     Array.prototype.forEach.call(document.querySelectorAll('#chap-list .chap'), function (b) {
       var k = b.getAttribute('data-key');
       var on = !!(state.clipSel[k] && state.clipMeta[k]);
@@ -7207,7 +7246,14 @@
     }).catch(function () { clipNote('打开文件夹选择器失败，请直接输入路径'); });
   }
 
-  function saveClips() {
+  var lastClipImport = null;
+
+  function openClipStudio() {
+    if (!clipSelectedCount()) { location.hash = '#/studio'; return; }
+    saveClips(true);
+  }
+
+  function saveClips(openStudio) {
     if (state.clipBusy) return;
     var items = clipSelectedItems();
     if (!items.length) return;
@@ -7217,12 +7263,17 @@
     });
     var inp = document.getElementById('clip-dir');
     var dir = inp ? inp.value.trim() : '';
+    var selection = JSON.stringify([dir, items]);
+    if (openStudio && lastClipImport && lastClipImport.selection === selection) {
+      location.hash = '#/studio?clip=' + encodeURIComponent(lastClipImport.id);
+      return;
+    }
     state.clipBusy = true;
     state.clipCovers = [];
     state.clipCoverPick = {};
     renderClipCovers();
     updateClipBar();
-    clipNote('正在准备保存 ' + items.length + ' 段…');
+    clipNote(openStudio ? '正在准备选中的片段，完成后会自动打开歌切制作台…' : '正在准备保存 ' + items.length + ' 段…');
     postJSON('/api/clip/start', { items: items, dir: dir }).then(function (d) {
       if (!d || d.error) {
         state.clipBusy = false;
@@ -7234,7 +7285,8 @@
         inp.value = d.dir;
         store.set('xl_clip_dir', d.dir);
       }
-      clipPoll();
+      lastClipImport = null;
+      clipPoll(d.batchId, openStudio, JSON.stringify([d.dir || dir, items]));
     }).catch(function () {
       state.clipBusy = false;
       updateClipBar();
@@ -7242,11 +7294,12 @@
     });
   }
 
-  function clipPoll() {
+  function clipPoll(batchId, openStudio, selection) {
     fetch('/api/clip/status').then(function (r) { return r.json(); }).then(function (d) {
+      if (!batchId || d.batchId !== batchId) throw new Error('切片任务已变更，请重新选择片段');
       if (d.running) {
         clipNote('保存中 ' + d.idx + '/' + d.total + '：' + (d.current || '…'));
-        setTimeout(clipPoll, 800);
+        setTimeout(function () { clipPoll(batchId, openStudio, selection); }, 800);
         return;
       }
       state.clipBusy = false;
@@ -7263,10 +7316,16 @@
       clipNote(msg);
       state.clipCovers = ok;
       renderClipCovers();
-    }).catch(function () {
+      if (ok.length && !bad.length && ok[0].studioId) {
+        lastClipImport = {selection:selection, id:ok[0].studioId};
+        if (openStudio && state.view === 'live') {
+          location.hash = '#/studio?clip=' + encodeURIComponent(ok[0].studioId);
+        }
+      }
+    }).catch(function (err) {
       state.clipBusy = false;
       updateClipBar();
-      clipNote('查询保存进度失败');
+      clipNote('查询保存进度失败：' + err.message);
     });
   }
 
@@ -8025,7 +8084,14 @@
     var clipPickBtn = document.getElementById('clip-pick');
     if (clipPickBtn) clipPickBtn.addEventListener('click', pickClipDir);
     var clipSaveBtn = document.getElementById('clip-save');
-    if (clipSaveBtn) clipSaveBtn.addEventListener('click', saveClips);
+    if (clipSaveBtn) clipSaveBtn.addEventListener('click', function () { saveClips(false); });
+    document.getElementById('clip-studio').addEventListener('click', openClipStudio);
+    document.querySelector('.tab[data-view="studio"]').addEventListener('click', function (e) {
+      if (state.view === 'live' && state.clipMode && clipSelectedCount()) {
+        e.preventDefault();
+        openClipStudio();
+      }
+    });
     var clipNamesBox = document.getElementById('clip-names');
     if (clipNamesBox) {
       clipNamesBox.addEventListener('input', function (e) {
@@ -8079,7 +8145,7 @@
       }
       toggleChapters(true);
       setClipMode(true);
-      clipNote('勾选要保存的分段，再点「保存为 MP4」');
+      clipNote('勾选分段后可保存为 MP4，或直接导入歌切制作台。');
       el.chaptersPanel.scrollIntoView({ block: 'nearest' });
     });
     updateClipBar();
@@ -8557,6 +8623,11 @@
     var box = document.getElementById('onboard');
     if (!box) return;
     box.hidden = false;
+    document.getElementById('ob-open-studio').onclick = function (event) {
+      event.preventDefault();
+      location.hash = '#/studio';
+      location.reload();
+    };
     var openWall = document.getElementById('ob-open-wall');
     openWall.hidden = !outsideRooms.length;
     openWall.onclick = function () {
@@ -8619,7 +8690,10 @@
 
     function pickStation(id) {
       if (!id) return;
-      ST_SET = [id];
+      // 主推放在首位，保留仍在名单里的其他亮灯及其顺序。
+      ST_SET = [id].concat(ST_SET.filter(function (other, index, saved) {
+        return other !== id && saved.indexOf(other) === index && findStation(other);
+      }));
       ST = id;
       saveStations();               // 记住选择（localStorage xl_stations）
       enter();
@@ -8986,7 +9060,7 @@
       var picked = false;
       try { picked = sessionStorage.getItem(PICK_KEY) === '1'; } catch (e) { /* 隐私模式 */ }
       // 有主播且这个会话已经选过人 → 直接进频道；否则停在选择页
-      if ((list.length || outsideRooms.length) && picked) initMain();
+      if (location.hash.split('?')[0] === '#/studio' || ((list.length || outsideRooms.length) && picked)) initMain();
       else showPicker(!list.length);
     }).catch(function () {
       initMain();                  // 服务不在：按老路子走，让页面自己报「未连接」
@@ -9389,7 +9463,7 @@
     }
 
     // 直播页可直接进入，已选主播可能都没有回放清单。
-    if (location.hash === '#/broadcast') route();
+    if (location.hash === '#/broadcast' || location.hash.split('?')[0] === '#/studio') route();
 
     if (isMainOnly() && window.PROGRAMS && window.PROGRAMS.programs
         && window.PROGRAMS.programs.length) {

@@ -162,7 +162,7 @@ window.__BOOT_T0 = Date.now();
   </div>
 
   <button type="button" class="btn small ghost" data-add-outside>添加斗鱼、虎牙或抖音直播间</button>
-  <a class="btn small ghost" href="/studio" target="_blank" rel="noopener">歌切制作台</a>
+  <a class="btn small ghost" href="#/studio" id="ob-open-studio">歌切制作台</a>
   <button type="button" class="btn small ghost" id="ob-open-wall" hidden>进入已保存的画面墙</button>
   <div class="ob-grid" id="ob-grid"></div>
 
@@ -239,6 +239,7 @@ window.__BOOT_T0 = Date.now();
     <a class="tab" data-view="broadcast" href="#/broadcast">直播间</a>
     <a class="tab" data-view="schedule" href="#/schedule">24 小时频道</a>
     <a class="tab" data-view="playlist" href="#/playlist">歌单</a>
+    <a class="tab" data-view="studio" href="#/studio">歌切</a>
     <a class="tab" data-view="multi" href="#/multi">监控室</a>
     <a class="tab" data-view="recorder" href="#/recorder">录播姬</a>
     <a class="tab" data-view="dynamic" href="#/dynamic">动态</a>
@@ -1109,6 +1110,11 @@ window.__BOOT_T0 = Date.now();
       </div>
     </section>
 
+    <section class="view" id="view-studio" aria-label="歌切制作台">
+      <p id="studio-error" role="status" hidden><span></span> <a href="#/studio">打开制作台</a></p>
+      <iframe id="studio-frame" title="歌切制作台" allow="autoplay; fullscreen"></iframe>
+    </section>
+
     <section class="view" id="view-about">
       <h1 class="title sm">关于这个频道</h1>
       <div class="about-grid" id="about-body"></div>
@@ -1595,7 +1601,7 @@ window.__BOOT_T0 = Date.now();
                placeholder="保存文件夹（默认 视频/噼里啪啦）" aria-label="保存文件夹">
         <button class="btn small ghost" id="clip-pick" type="button">选择文件夹</button>
         <button class="btn small primary" id="clip-save" type="button" disabled>保存为 MP4</button>
-        <a class="btn small ghost" href="/studio" target="_blank" rel="noopener">歌切制作台</a>
+        <button class="btn small ghost" type="button" id="clip-studio">歌切制作台</button>
       </div>
       <div class="clip-names" id="clip-names" hidden></div>
       <div class="clip-note" id="clip-note"></div>

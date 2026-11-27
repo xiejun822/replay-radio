@@ -1647,7 +1647,7 @@ def _clip_worker(items, outdir):
         out = _clip_unique(os.path.join(outdir, base + ".mp4"))
         name = os.path.basename(out)
         with CLIP_LOCK:
-            CLIP_JOB.update(idx=i + 1, current=name)
+            CLIP_JOB.update(idx=i + 1, current=name, filename=name, percent=None, stage="正在读取视频")
         try:
             media = _clip_media(it["bvid"], it["cid"])
             dur = max(0.5, min(CLIP_MAX_SEC, float(it["end"]) - float(it["start"])))
@@ -1681,7 +1681,9 @@ def _clip_worker(items, outdir):
                     try:
                         done = float(line.split("=", 1)[1]) / 1e6
                         with CLIP_LOCK:
-                            CLIP_JOB["current"] = "%s（%d%%）" % (name, min(99, int(done * 100 / dur)))
+                            percent = min(99, max(0, int(done * 100 / dur)))
+                            CLIP_JOB.update(current="%s（%d%%）" % (name, percent),
+                                            percent=percent, stage="正在保存")
                     except (ValueError, ZeroDivisionError):
                         pass
                 elif line.strip() and "=" not in line[:24]:
@@ -1693,7 +1695,7 @@ def _clip_worker(items, outdir):
             covers = {}
             try:
                 with CLIP_LOCK:
-                    CLIP_JOB["current"] = "%s（记录封面候选…）" % name
+                    CLIP_JOB.update(current="%s（记录封面候选…）" % name, percent=None, stage="正在整理封面")
                 covers = _clip_cover_meta(out, dur)
             except Exception as ce:
                 covers = {"error": str(ce)[:200]}
@@ -1753,7 +1755,7 @@ def api_clip_start(obj):
     batch_id = uuid.uuid4().hex
     with CLIP_LOCK:
         if CLIP_JOB.get("running"):
-            return 409, {"error": "上一批还在保存，请等它结束"}
+            return 409, {"error": "上一批还在保存，请等它结束", "batchId": CLIP_JOB["batchId"]}
         CLIP_JOB = {"batchId": batch_id, "running": True, "idx": 0, "total": len(clean), "current": "",
                     "dir": outdir, "done": [], "error": "", "started": time.time(),
                     "cancel": False}

@@ -1,7 +1,10 @@
 """Host the pinned SongCut Studio on a separate loopback origin."""
+import math
 import os
 import shutil
 import sys
+import subprocess
+import tempfile
 import threading
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -10,6 +13,80 @@ BASE = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parents[1]))
 SOURCE = BASE / "vendor" / "songcut-studio"
 _server = None
 _lock = threading.Lock()
+
+
+def trim_media(handler, ffmpeg):
+    headers = handler.headers
+    if headers.get("Origin") != "http://127.0.0.1:%d" % handler.server.server_port:
+        return handler._send_json(403, {"error": "请从本地歌切制作台发起裁剪"})
+    kind = headers.get("X-Media-Kind")
+    if kind not in ("audio", "video"):
+        raise ValueError("请选择音频或视频素材")
+    try:
+        start = float(headers.get("X-Trim-Start", ""))
+        end = float(headers.get("X-Trim-End", ""))
+    except ValueError:
+        raise ValueError("起点和终点必须是秒数") from None
+    if not math.isfinite(start) or not math.isfinite(end) or not 0 <= start < end:
+        raise ValueError("起点必须大于等于零，终点必须晚于起点")
+    length = headers.get("Content-Length", "")
+    if not length.isdigit() or not 0 < int(length) <= 4 * 1024**3:
+        raise ValueError("素材为空或超过 4 GB")
+    if not ffmpeg:
+        raise ValueError("未找到裁剪所需的 FFmpeg")
+    with tempfile.TemporaryDirectory(prefix="replayradio-trim-") as temp:
+        source = Path(temp) / "source"
+        remaining = int(length)
+        with source.open("wb") as stream:
+            while remaining:
+                block = handler.rfile.read(min(remaining, 1024**2))
+                if not block:
+                    raise ValueError("素材传输中断，请重新裁剪")
+                stream.write(block)
+                remaining -= len(block)
+        # Accept self-contained media containers, including MP4 and MP3.
+        input_options = ["-protocol_whitelist", "file", "-format_whitelist",
+                         "mov,mp3,wav,flac,ogg,aac,matroska,webm,avi,aiff"]
+        flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        probe_name = "ffprobe.exe" if os.name == "nt" else "ffprobe"
+        probe = Path(ffmpeg).with_name(probe_name)
+        probe = str(probe) if probe.is_file() else shutil.which("ffprobe")
+        if not probe:
+            raise ValueError("未找到读取素材时长所需的 ffprobe")
+        result = subprocess.run([probe, "-v", "error", *input_options, "-show_entries",
+                                 "format=duration", "-of", "csv=p=0", str(source)],
+                                capture_output=True, timeout=60, creationflags=flags)
+        try:
+            duration = float(result.stdout.strip())
+        except ValueError:
+            raise ValueError("无法读取素材时长，请检查文件格式") from None
+        # Browser and container durations can differ by one frame or MP3 padding.
+        if not math.isfinite(duration) or start >= duration or end > duration + 0.1:
+            raise ValueError("裁剪范围超出素材时长")
+        if kind == "video":
+            output = Path(temp) / "clip.mp4"
+            mime = "video/mp4"
+            codec = ["-map", "0:V:0", "-map", "0:a:0?", "-vf", "pad=ceil(iw/2)*2:ceil(ih/2)*2",
+                     "-c:v", "libx264", "-preset", "veryfast", "-crf", "18", "-pix_fmt", "yuv420p",
+                     "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart"]
+        else:
+            output = Path(temp) / "clip.mp3"
+            mime = "audio/mpeg"
+            codec = ["-map", "0:a:0", "-c:a", "libmp3lame", "-q:a", "2"]
+        result = subprocess.run([ffmpeg, "-nostdin", "-v", "error", *input_options,
+                                 "-ss", str(start), "-i", str(source), "-t", str(min(end, duration) - start),
+                                 *codec, "-map_chapters", "-1", str(output)],
+                                capture_output=True, timeout=3600, creationflags=flags)
+        if result.returncode or not output.stat().st_size:
+            detail = result.stderr.decode("utf-8", "replace").strip()[-360:]
+            raise ValueError("裁剪失败，请检查素材的音视频轨道。" + detail)
+        with output.open("rb") as stream:
+            handler.send_response(200)
+            handler.send_header("Content-Type", mime)
+            handler.send_header("Content-Length", str(output.stat().st_size))
+            handler.send_header("Cache-Control", "no-store")
+            handler.end_headers()
+            shutil.copyfileobj(stream, handler.wfile)
 
 
 def open_editor(main_port, ffmpeg, alive, bye, clip=None):
@@ -28,11 +105,13 @@ def open_editor(main_port, ffmpeg, alive, bye, clip=None):
                     path = urlsplit(self.path).path
                     if path in ("/", "/index.html"):
                         page = (SOURCE / "index.html").read_text(encoding="utf-8")
-                        page = page.replace("</body>", '<script src="/rr/import.js"></script></body>')
+                        page = page.replace("</body>", '<script src="/rr/trim.js"></script><script src="/rr/import.js"></script></body>')
                         return self.send_bytes(page.encode(), "text/html; charset=utf-8")
                     if path == "/rr/import.js":
                         script = (BASE / "assets" / "studio-import.js").read_bytes()
                         return self.send_bytes(script, "application/javascript")
+                    if path == "/rr/trim.js":
+                        return self.send_bytes((BASE / "assets" / "studio-trim.js").read_bytes(), "application/javascript")
                     # Each exported clip gets its own draft; keep the normal editor's draft
                     # and layout presets when two songs are open at the same time.
                     if path == "/pendant-storage.js":
@@ -68,6 +147,17 @@ def open_editor(main_port, ffmpeg, alive, bye, clip=None):
                     self.wfile.write(data)
 
                 def do_POST(self):
+                    if self.path == "/rr/trim":
+                        try:
+                            return trim_media(self, studio.find_ffmpeg())
+                        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+                            return
+                        except ValueError as exc:
+                            return self._send_json(400, {"error": str(exc)})
+                        except subprocess.TimeoutExpired:
+                            return self._send_json(504, {"error": "裁剪超时，请缩短选段后重试"})
+                        except OSError as exc:
+                            return self._send_json(500, {"error": "处理素材失败：" + str(exc)})
                     if self.path in ("/rr/alive", "/rr/bye"):
                         if self.headers.get("Origin") != "http://127.0.0.1:%d" % self.server.server_port:
                             return self._send_json(403, {"error": "只接受制作台页面的请求"})

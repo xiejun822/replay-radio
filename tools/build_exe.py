@@ -299,6 +299,9 @@ def build_exe():
     if not ff or not probe:
         sys.exit("歌切制作台导出需要 ffmpeg 和 ffprobe，请配置 FFMPEG / FFPROBE")
     args += ["--add-data", probe + os.pathsep + "ffmpeg", "--hidden-import", "secrets"]
+    for module in ("ImageChops", "ImageColor", "ImageDraw", "ImageEnhance", "ImageFilter",
+                   "ImageFont", "ImageOps", "ImageSequence"):
+        args += ["--hidden-import", "PIL." + module]
     if ff:
         args += ["--add-data", ff + os.pathsep + "ffmpeg"]
         print("打包 FFmpeg：%s（%.0f MB）" % (ff, os.path.getsize(ff) / 1048576))

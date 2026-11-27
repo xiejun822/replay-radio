@@ -1409,11 +1409,10 @@ def _clip_unique(path):
     if not os.path.exists(path):
         return path
     base, ext = os.path.splitext(path)
-    for i in range(2, 100):
-        p = "%s_%d%s" % (base, i, ext)
-        if not os.path.exists(p):
-            return p
-    return path
+    i = 2
+    while os.path.exists("%s_%d%s" % (base, i, ext)):
+        i += 1
+    return "%s_%d%s" % (base, i, ext)
 
 
 # ---- 封面：保存时只记候选时间点，用户确认后才落盘 ---------------------------
@@ -1464,11 +1463,12 @@ def _clip_cover_filter(size):
             % (lw, lh, lw, lh, pw, ph, pw, ph))
 
 
-def _clip_cover_meta(out, dur):
+def _clip_cover_meta(out, dur, source):
     """保存时写侧车：只记候选时间点，chosen 为空，等用户确认。"""
     times = _clip_cover_times(dur)
     meta = {"video": os.path.basename(out),
             "base": os.path.basename(os.path.splitext(out)[0]),
+            "source": source, "bytes": os.path.getsize(out),
             "count": len(times),
             "candidates": [{"index": i + 1, "at": t} for i, t in enumerate(times)],
             "chosen": None,
@@ -1629,6 +1629,53 @@ def _clip_media(bvid, cid):
     raise RuntimeError(last or "取不到播放地址")
 
 
+def _clip_existing(outdir, base, auto, source, dur, ff):
+    # Sorted suffixes also find _2 etc. after the original was removed.
+    pattern = re.compile(re.escape(base) + r"(?:_(\d+))?\.mp4$", re.I)
+    candidates = []
+    for name in os.listdir(outdir):
+        match = pattern.fullmatch(name)
+        if match:
+            candidates.append((int(match[1] or 0), name))
+    probe = os.path.join(os.path.dirname(ff), "ffprobe.exe" if os.name == "nt" else "ffprobe")
+    if not os.path.isfile(probe):
+        probe = shutil.which("ffprobe")
+    if not probe:
+        return None
+    for _, name in sorted(candidates):
+        path = os.path.join(outdir, name)
+        meta = _read_json_file(_clip_meta_path(path))
+        if not isinstance(meta, dict) or meta.get("video") != name:
+            continue
+        if "source" in meta:
+            if meta["source"] != source:
+                continue
+        elif base != auto or not meta.get("candidates"):
+            continue  # Legacy custom names do not identify a recording or its bounds.
+        try:
+            size = os.path.getsize(path)
+            if not size or meta.get("bytes", size) != size:
+                continue
+            # With faststart even a truncated MP4 can report the full duration.
+            # Seek near the end and require a readable video packet there.
+            result = subprocess.run([probe, "-v", "error", "-f", "mov", "-select_streams", "v:0",
+                "-read_intervals", "%.3f%%" % max(0, dur - 0.5), "-show_entries",
+                "format=duration:packet=pts_time,duration_time,pos,size", "-of", "json", path],
+                capture_output=True, timeout=15, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            if result.returncode or result.stderr:
+                continue
+            info = json.loads(result.stdout)
+            if abs(float(info["format"]["duration"]) - dur) > 0.25:
+                continue
+            for packet in info.get("packets", []):
+                end = float(packet["pts_time"]) + float(packet.get("duration_time", 0))
+                if end >= dur - 0.25 and int(packet["pos"]) + int(packet["size"]) <= size:
+                    return path, meta
+        except (OSError, ValueError, KeyError, TypeError, subprocess.TimeoutExpired):
+            continue
+    return None
+
+
 def _clip_worker(items, outdir):
     global CLIP_JOB
     try:
@@ -1644,68 +1691,79 @@ def _clip_worker(items, outdir):
                                            it["start"], it["end"]))[0]
         # 用户给了名字就用它（视频与封面共用同一个 basename）；重名由 _clip_unique 加序号
         base = _clip_base_name(it.get("name"), auto)
-        out = _clip_unique(os.path.join(outdir, base + ".mp4"))
-        name = os.path.basename(out)
+        name = base + ".mp4"
         with CLIP_LOCK:
-            CLIP_JOB.update(idx=i + 1, current=name, filename=name, percent=None, stage="正在读取视频")
+            CLIP_JOB.update(idx=i + 1, current=name, filename=name, percent=None, stage="正在检查已有文件")
         try:
-            media = _clip_media(it["bvid"], it["cid"])
-            dur = max(0.5, min(CLIP_MAX_SEC, float(it["end"]) - float(it["start"])))
-            ss = "%.3f" % float(it["start"])
-            tail = ["-t", "%.3f" % dur,
-                    "-vf", CLIP_VF,
-                    "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
-                    # 1080p 给个上限，避免高动态画面把文件堆到几百兆；1 小时最长 4.5GB
-                    "-maxrate", "10M", "-bufsize", "20M", "-profile:v", "high",
-                    "-c:a", "aac", "-b:a", "192k", "-ar", "48000",
-                    "-sn", "-dn",
-                    "-movflags", "+faststart", "-y", out]
-            if media["kind"] == "dash":
-                # 两路输入各带一次 -ss：只会作用于紧随其后的那个 -i
-                cmd = [ff, "-hide_banner", "-loglevel", "error", "-progress", "pipe:1",
-                       "-nostats",
-                       "-headers", hdr, "-ss", ss, "-i", media["v"],
-                       "-headers", hdr, "-ss", ss, "-i", media["a"],
-                       "-map", "0:v:0", "-map", "1:a:0"] + tail
+            source = {key: it[key] for key in ("bvid", "cid", "start", "end")}
+            dur = max(0.5, min(CLIP_MAX_SEC, it["end"] - it["start"]))
+            existing = _clip_existing(outdir, base, auto, source, dur, ff)
+            if existing:
+                out, covers = existing
+                name = os.path.basename(out)
+                media = {}
             else:
-                cmd = [ff, "-hide_banner", "-loglevel", "error", "-progress", "pipe:1",
-                       "-nostats", "-headers", hdr,
-                       "-ss", ss, "-i", media["url"]] + tail
-            # stderr 并进 stdout：分开两个管道又只读一个，错误多一点就会把 ffmpeg 卡死
-            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                    text=True, encoding="utf-8", errors="ignore",
-                                    creationflags=NO_WINDOW, startupinfo=HIDE_SI)
-            errbuf = []
-            for line in proc.stdout:
-                if line.startswith("out_time_ms="):
-                    try:
-                        done = float(line.split("=", 1)[1]) / 1e6
-                        with CLIP_LOCK:
-                            percent = min(99, max(0, int(done * 100 / dur)))
-                            CLIP_JOB.update(current="%s（%d%%）" % (name, percent),
-                                            percent=percent, stage="正在保存")
-                    except (ValueError, ZeroDivisionError):
-                        pass
-                elif line.strip() and "=" not in line[:24]:
-                    errbuf.append(line.strip())
-            proc.wait(timeout=1800)
-            if proc.returncode != 0:
-                raise RuntimeError("".join(errbuf) or ("ffmpeg 退出码 %s" % proc.returncode))
-            # 封面：只记候选时间点，等用户在页面里挑一版再落盘
-            covers = {}
-            try:
+                out = _clip_unique(os.path.join(outdir, name))
+                name = os.path.basename(out)
                 with CLIP_LOCK:
-                    CLIP_JOB.update(current="%s（记录封面候选…）" % name, percent=None, stage="正在整理封面")
-                covers = _clip_cover_meta(out, dur)
-            except Exception as ce:
-                covers = {"error": str(ce)[:200]}
+                    CLIP_JOB.update(current=name, filename=name, stage="正在读取视频")
+                media = _clip_media(it["bvid"], it["cid"])
+                ss = "%.3f" % float(it["start"])
+                tail = ["-t", "%.3f" % dur,
+                        "-vf", CLIP_VF,
+                        "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
+                        # 1080p 给个上限，避免高动态画面把文件堆到几百兆；1 小时最长 4.5GB
+                        "-maxrate", "10M", "-bufsize", "20M", "-profile:v", "high",
+                        "-c:a", "aac", "-b:a", "192k", "-ar", "48000",
+                        "-sn", "-dn",
+                        "-movflags", "+faststart", "-y", out]
+                if media["kind"] == "dash":
+                    # 两路输入各带一次 -ss：只会作用于紧随其后的那个 -i
+                    cmd = [ff, "-hide_banner", "-loglevel", "error", "-progress", "pipe:1",
+                           "-nostats",
+                           "-headers", hdr, "-ss", ss, "-i", media["v"],
+                           "-headers", hdr, "-ss", ss, "-i", media["a"],
+                           "-map", "0:v:0", "-map", "1:a:0"] + tail
+                else:
+                    cmd = [ff, "-hide_banner", "-loglevel", "error", "-progress", "pipe:1",
+                           "-nostats", "-headers", hdr,
+                           "-ss", ss, "-i", media["url"]] + tail
+                # stderr 并进 stdout：分开两个管道又只读一个，错误多一点就会把 ffmpeg 卡死
+                proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                        text=True, encoding="utf-8", errors="ignore",
+                                        creationflags=NO_WINDOW, startupinfo=HIDE_SI)
+                errbuf = []
+                for line in proc.stdout:
+                    if line.startswith("out_time_ms="):
+                        try:
+                            done = float(line.split("=", 1)[1]) / 1e6
+                            with CLIP_LOCK:
+                                percent = min(99, max(0, int(done * 100 / dur)))
+                                CLIP_JOB.update(current="%s（%d%%）" % (name, percent),
+                                                percent=percent, stage="正在保存")
+                        except (ValueError, ZeroDivisionError):
+                            pass
+                    elif line.strip() and "=" not in line[:24]:
+                        errbuf.append(line.strip())
+                proc.wait(timeout=1800)
+                if proc.returncode != 0:
+                    raise RuntimeError("".join(errbuf) or ("ffmpeg 退出码 %s" % proc.returncode))
+                # 封面：只记候选时间点，等用户在页面里挑一版再落盘
+                covers = {}
+                try:
+                    with CLIP_LOCK:
+                        CLIP_JOB.update(current="%s（记录封面候选…）" % name, percent=None, stage="正在整理封面")
+                    covers = _clip_cover_meta(out, dur, source)
+                except Exception as ce:
+                    covers = {"error": str(ce)[:200]}
             with CLIP_LOCK:
                 CLIP_JOB["done"].append({"name": name, "path": out, "ok": True,
-                                         "studioId": uuid.uuid4().hex,
+                                         "studioId": uuid.uuid5(uuid.NAMESPACE_URL, os.path.normcase(out)).hex,
+                                         "reused": bool(existing),
                                          "song": it.get("name") or it.get("song") or base,
                                          "artist": it.get("artist", ""),
                                          "quality": media.get("id"),
-                                         "src": media["kind"],
+                                         "src": media.get("kind"),
                                          "srcHeight": media.get("height") or 0,
                                          "res": "%dx%d" % (CLIP_W, CLIP_H),
                                          "seconds": round(dur, 1),

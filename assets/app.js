@@ -7229,7 +7229,7 @@
         state.clipBusy = true;
         updateClipBar();
         showClipProgress(d);
-        clipPoll(d.batchId, false, null);
+        clipPoll(d.batchId, false);
       }
     }).catch(function () { /* 离线时留空，保存时会用默认目录 */ });
   }
@@ -7251,8 +7251,6 @@
       }
     }).catch(function () { clipNote('打开文件夹选择器失败，请直接输入路径'); });
   }
-
-  var lastClipImport = null;
 
   function showClipProgress(d) {
     var meter = document.getElementById('clip-meter');
@@ -7284,23 +7282,18 @@
     });
     var inp = document.getElementById('clip-dir');
     var dir = inp ? inp.value.trim() : '';
-    var selection = JSON.stringify([dir, items]);
-    if (openStudio && lastClipImport && lastClipImport.selection === selection) {
-      location.hash = '#/studio?clip=' + encodeURIComponent(lastClipImport.id);
-      return;
-    }
     state.clipBusy = true;
     state.clipCovers = [];
     state.clipCoverPick = {};
     renderClipCovers();
     updateClipBar();
-    showClipProgress({stage:'正在准备保存'});
+    showClipProgress({stage:'正在检查已有文件'});
     clipNote(openStudio ? '正在准备选中的片段，完成后会自动打开歌切制作台…' : '正在准备保存 ' + items.length + ' 段…');
     postJSON('/api/clip/start', { items: items, dir: dir }).then(function (d) {
       if (!d || d.error) {
         if (d && d.batchId) {
           clipNote('正在显示上一批的保存进度');
-          clipPoll(d.batchId, false, null);
+          clipPoll(d.batchId, false);
           return;
         }
         document.getElementById('clip-progress').hidden = true;
@@ -7313,8 +7306,7 @@
         inp.value = d.dir;
         store.set('xl_clip_dir', d.dir);
       }
-      lastClipImport = null;
-      clipPoll(d.batchId, openStudio, JSON.stringify([d.dir || dir, items]));
+      clipPoll(d.batchId, openStudio);
     }).catch(function () {
       document.getElementById('clip-progress').hidden = true;
       state.clipBusy = false;
@@ -7323,24 +7315,25 @@
     });
   }
 
-  function clipPoll(batchId, openStudio, selection) {
+  function clipPoll(batchId, openStudio) {
     fetch('/api/clip/status').then(function (r) { return r.json(); }).then(function (d) {
       if (d.batchId !== batchId) throw new Error('切片任务已变更，请重新选择片段');
       if (d.running) {
         showClipProgress(d);
-        setTimeout(function () { clipPoll(batchId, openStudio, selection); }, 800);
+        setTimeout(function () { clipPoll(batchId, openStudio); }, 800);
         return;
       }
       state.clipBusy = false;
       updateClipBar();
       var ok = (d.done || []).filter(function (x) { return x.ok; });
       var bad = (d.done || []).filter(function (x) { return !x.ok; });
+      var reused = ok.filter(function (x) { return x.reused; }).length;
       if (ok.length && !bad.length) {
-        showClipProgress({stage:'保存完成', idx:d.total, total:d.total, percent:100});
+        showClipProgress({stage:reused === ok.length ? '已使用现有文件' : '保存完成', idx:d.total, total:d.total, percent:100});
       } else {
         document.getElementById('clip-progress').hidden = true;
       }
-      var msg = '已保存 ' + ok.length + ' 段到 ' + (d.dir || '');
+      var msg = '新保存 ' + (ok.length - reused) + ' 段，复用 ' + reused + ' 段 · ' + (d.dir || '');
       if (bad.length) msg += '；失败 ' + bad.length + ' 段：' + (bad[0].error || '');
       var noCover = ok.filter(function (x) {
         return !(x.covers && x.covers.candidates && x.covers.candidates.length);
@@ -7351,7 +7344,6 @@
       state.clipCovers = ok;
       renderClipCovers();
       if (ok.length && !bad.length && ok[0].studioId) {
-        lastClipImport = {selection:selection, id:ok[0].studioId};
         if (openStudio && state.view === 'live') {
           location.hash = '#/studio?clip=' + encodeURIComponent(ok[0].studioId);
         }

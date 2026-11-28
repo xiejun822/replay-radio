@@ -25,6 +25,7 @@
 import argparse
 import base64
 import concurrent.futures
+import gzip
 import hashlib
 import http.client
 import html
@@ -1092,11 +1093,20 @@ STATIONLESS_OK = (
     "/api/stations/following", "/api/stations/bulk",
     "/api/stations/main",
     "/api/ping", "/api/status", "/api/img", "/api/quit",
+    "/api/update/check", "/api/update/status", "/api/update/download", "/api/update/apply",
     "/api/clip/cover", "/api/clip/cover/preview",
     "/api/clip/cover/choose",  # 本地封面预览/确认，与主播无关
     "/api/page/alive", "/api/page/bye",
     "/api/protocol/register", "/api/protocol/unregister",
     "/api/following/live",     # 只依赖登录态，与有没有注册主播无关
+    "/api/feedback", "/api/feedback/conf",   # 反馈是本机功能，与主播无关
+    # 监控室的推荐/工会/Danmist/按房间弹幕都不依赖注册表
+    "/api/live/recommend", "/api/live/guilds", "/api/live/guild",
+    "/api/live/chat/recent", "/api/live/chat/stop",
+    "/api/live/board", "/api/live/board/read", "/api/live/song",
+    "/api/vtbs/status", "/api/vtbs/refresh", "/api/vtbs/profile",
+    "/api/guild/add", "/api/live/guild/refresh", "/api/danmist/status", "/api/danmist/start",
+    "/api/feedback/upload", "/api/feedback/reveal",
     "/api/live/ws",            # 同上：房间号由 URL 带，跟注册表无关
     # 歌单：导入的是任意 B 站投稿，与注册表里有没有主播无关（首批用户就是先导歌单）
     "/api/playlists", "/api/playlist",
@@ -1162,6 +1172,743 @@ def urlopen(req, timeout):
         raise
     except Exception:
         return urllib.request.urlopen(req, timeout=timeout)
+
+
+# ---------------------------------------------------------------- 版本更新
+# 检查只请求 GitHub Releases API（失败再退官网 version.json）；下载与替换 EXE
+# 全部由用户点了「立即更新」之后才发生 —— 启动时绝不自动下载、安装或重启。
+APP_VERSION = "1.9.38"     # 与 build_exe.py:APP_VERSION / site/index.html:VERSION 同步
+UPDATE_REPO = "xiejun822/replay-radio"
+UPDATE_API = "https://api.github.com/repos/%s/releases/latest" % UPDATE_REPO
+UPDATE_LIST_API = "https://api.github.com/repos/%s/releases?per_page=20" % UPDATE_REPO
+UPDATE_TIMEOUT = 8         # 检查很短；下载单独给更长超时
+UPDATE_DIR = os.path.join(APPDIR, "updates")   # 下载的 EXE 与更新脚本都放这里
+UPDATE_JOB = {"running": False, "stage": "", "pct": 0, "error": "",
+              "path": "", "version": ""}
+UPDATE_LOCK = threading.Lock()
+
+
+def _ver_tuple(s):
+    """'1.9.21' → (1, 9, 21)，用于比较；非数字段归零。"""
+    out = []
+    for p in str(s or "").lstrip("vV").split(".")[:4]:
+        m = re.match(r"\d+", p.strip())
+        out.append(int(m.group()) if m else 0)
+    while len(out) < 3:
+        out.append(0)
+    return tuple(out)
+
+
+def _update_fetch_json(url, timeout=UPDATE_TIMEOUT):
+    req = urllib.request.Request(url, headers={
+        "User-Agent": UA, "Accept": "application/vnd.github+json"})
+    with urlopen(req, timeout=timeout) as r:
+        return json.loads(r.read().decode("utf-8", "replace"))
+
+
+USER_NOTES_BEGIN = "<!-- USER_NOTES_BEGIN -->"
+USER_NOTES_END = "<!-- USER_NOTES_END -->"
+
+
+def _popup_notes(body):
+    """只取 Release 正文里给用户看的公告段。
+
+    v1.9.38 起生成的公告用标记包住用户语言段落；弹窗显示这一段，
+    技术细节留在 Release 页面。旧版本正文没有标记 → 退回全文，行为不变。
+    """
+    s = str(body or "").replace("\r\n", "\n")
+    if USER_NOTES_BEGIN in s and USER_NOTES_END in s:
+        inner = s.split(USER_NOTES_BEGIN, 1)[1].split(USER_NOTES_END, 1)[0]
+        if inner.strip():
+            return inner.strip()
+    return re.sub(r"<!--\s*USER_NOTES_(?:BEGIN|END)\s*-->", "", s).strip()
+
+
+def api_update_check():
+    """GET /api/update/check —— 有新版才返回 available=true；不下载任何东西。"""
+    cur = APP_VERSION
+    data = None
+    src = ""
+    try:
+        d = _update_fetch_json(UPDATE_API)
+        rel = d.get("tag_name") or ""
+        exe = next((a for a in (d.get("assets") or [])
+                    if str(a.get("name") or "").lower().endswith(".exe")), None)
+        if rel and exe:
+            body = str(d.get("body") or "").replace("\r\n", "\n").strip()
+            data = {"version": rel.lstrip("vV"),
+                    "url": exe.get("browser_download_url") or "",
+                    "name": exe.get("name") or "",
+                    "size": int(exe.get("size") or 0),
+                    "sha256": str((exe.get("digest") or "").replace("sha256:", "")),
+                    # 弹窗只显示标记里的用户公告（无标记时退回全文）
+                    "notes": _popup_notes(body)[:6000],
+                    "notes_ok": bool(body),
+                    "title": d.get("name") or rel,
+                    "page": d.get("html_url") or
+                            ("https://github.com/%s/releases/latest" % UPDATE_REPO),
+                    "published": d.get("published_at") or ""}
+            src = "github"
+            # 跨多个版本升级时，把「当前版本之后」的每个版本公告分别列出来。
+            # 原来只取 /releases/latest，落后 5 个版本的人也只能看到最新那一版。
+            try:
+                arr = _update_fetch_json(UPDATE_LIST_API)
+                blocks, vers = [], []
+                for r in (arr if isinstance(arr, list) else [])[:12]:
+                    tag = str(r.get("tag_name") or "").lstrip("vV")
+                    body = str(r.get("body") or "").replace("\r\n", "\n").strip()
+                    if not tag or not body:
+                        continue
+                    if _ver_tuple(tag) <= _ver_tuple(cur):
+                        continue
+                    # 公告正文自己带「## v1.9.35 · 日期」时去掉这一行，避免与下面拼的标题重复
+                    body = re.sub(r"^\s*#{1,4}\s*v?%s[^\n]*\n+" % re.escape(tag),
+                                  "", body, count=1, flags=re.I).strip()
+                    body = _popup_notes(body)
+                    if not body:
+                        continue
+                    blocks.append("## v%s\n\n%s" % (tag, body))
+                    vers.append(tag)
+                if blocks:
+                    data["notes"] = "\n\n".join(blocks)[:8000]
+                    data["versions"] = vers
+            except Exception:
+                pass
+    except urllib.error.HTTPError as exc:
+        if exc.code == 404:
+            return 200, {"ok": True, "available": False, "current": cur, "checked": int(time.time())}
+    except Exception:
+        pass
+    if not data:
+        return 200, {"ok": True, "available": False, "current": cur,
+                     "checked": int(time.time()), "error": "检查失败（网络不可达）",
+                     "fallback": "https://github.com/%s/releases/latest" % UPDATE_REPO}
+    new = _ver_tuple(data["version"])
+    return 200, {"ok": True, "current": cur, "latest": data["version"],
+                 "available": new > _ver_tuple(cur), "source": src,
+                 "checked": int(time.time()), **data}
+
+
+def _update_download(info):
+    """后台下载新 EXE；校验字节数与 sha256（上游给出时才校验）。"""
+    global UPDATE_JOB
+    target = os.path.join(
+        UPDATE_DIR, "ReplayRadio-v%s.exe" % re.sub(r"[^0-9A-Za-z.]", "", info["version"]))
+    try:
+        os.makedirs(UPDATE_DIR, exist_ok=True)
+        url = info.get("url") or ""
+        if not url.startswith("https://github.com/%s/releases/download/" % UPDATE_REPO):
+            raise RuntimeError("下载地址不合法")
+        req = urllib.request.Request(url, headers={"User-Agent": UA})
+        total = int(info.get("size") or 0)
+        got = 0
+        with urlopen(req, timeout=120) as r, open(target + ".part", "wb") as f:
+            while True:
+                chunk = r.read(65536)
+                if not chunk:
+                    break
+                f.write(chunk)
+                got += len(chunk)
+                with UPDATE_LOCK:
+                    UPDATE_JOB["pct"] = min(99, int(got * 100 / total)) if total else 0
+        if total and got != total:
+            raise RuntimeError("下载不完整（%d/%d 字节）" % (got, total))
+        if info.get("sha256"):
+            h = hashlib.sha256()
+            with open(target + ".part", "rb") as f:
+                for block in iter(lambda: f.read(1 << 20), b""):
+                    h.update(block)
+            if h.hexdigest().lower() != info["sha256"].lower():
+                raise RuntimeError("校验失败（SHA-256 不匹配）")
+        os.replace(target + ".part", target)
+        with UPDATE_LOCK:
+            # running 必须一起清掉：否则一次成功下载之后，再点「重试」会被判成
+            # 「正在下载中」而永远 409。
+            UPDATE_JOB.update(stage="done", pct=100, path=target,
+                              version=info["version"], running=False)
+    except Exception as e:
+        with UPDATE_LOCK:
+            UPDATE_JOB.update(stage="error", error=str(e)[:300], running=False)
+        # 不删半成品：本机的删除会被劫持到回收站（fail-closed），删失败还会拖住线程。
+        # 残留的 .part 下次下载直接覆盖，且不会被当成安装包（apply 只认 .exe）。
+
+
+def api_update_download(obj):
+    """POST /api/update/download {'version','url','size','sha256'} —— 仅用户确认后调用。"""
+    with UPDATE_LOCK:
+        if UPDATE_JOB["running"]:
+            return 409, {"error": "正在下载中"}
+        info = {"version": str(obj.get("version") or "").strip(),
+                "url": str(obj.get("url") or "").strip(),
+                "size": int(obj.get("size") or 0),
+                "sha256": str(obj.get("sha256") or "").strip()}
+    if not re.fullmatch(r"\d+(\.\d+){1,3}", info["version"]) or not info["url"]:
+        return 400, {"error": "版本信息不完整"}
+    # 地址校验放在请求线程里做：不合法就立刻 400，不要先起线程再在后台失败
+    if not info["url"].startswith("https://github.com/%s/releases/download/" % UPDATE_REPO):
+        return 400, {"error": "下载地址不合法"}
+    if _ver_tuple(info["version"]) <= _ver_tuple(APP_VERSION):
+        return 400, {"error": "没有新版可下载"}
+    with UPDATE_LOCK:
+        UPDATE_JOB.update(running=True, stage="downloading", pct=0, error="",
+                          path="", version=info["version"])
+    threading.Thread(target=_update_download, args=(info,), daemon=True).start()
+    return 200, {"ok": True}
+
+
+def api_update_status():
+    with UPDATE_LOCK:
+        d = dict(UPDATE_JOB)
+    return 200, d
+
+
+def _update_apply_script(old_exe, new_exe, pid):
+    """生成「等旧进程退出 → 备份 → 覆盖 → 重启」的更新脚本。
+
+    ⚠️ 变量不能叫 `$pid`：在 PowerShell 里那是只读的自动变量，赋值会抛
+       「Cannot overwrite variable PID」，脚本第一行就挂 —— 替换永远不会发生。
+    ⚠️ 覆盖要重试：进程刚退出时 EXE 可能还被句柄占着几百毫秒。
+    """
+    def ps(v):
+        return str(v).replace("'", "''")
+    return (
+        "$ErrorActionPreference='Stop'\n"
+        "$old='%s'\n$new='%s'\n$targetPid=%d\n"
+        "for($i=0;$i -lt 180;$i++){"
+        "if(-not (Get-Process -Id $targetPid -ErrorAction SilentlyContinue)){break};"
+        "Start-Sleep -Seconds 1}\n"
+        "if(Get-Process -Id $targetPid -ErrorAction SilentlyContinue){exit 1}\n"
+        "for($i=0;$i -lt 20;$i++){\n"
+        "  try{\n"
+        "    Copy-Item -LiteralPath $new -Destination ($old + '.old') -Force\n"
+        "    Copy-Item -LiteralPath $new -Destination $old -Force\n"
+        "    break\n"
+        "  }catch{Start-Sleep -Milliseconds 500}\n"
+        "}\n"
+        "Start-Process -FilePath $old\n"
+        % (ps(old_exe), ps(new_exe), int(pid))
+    )
+
+
+def api_update_apply():
+    """POST /api/update/apply —— 写更新脚本并安全退出，由脚本替换 + 重启。
+
+    ⚠️ 脚本必须在**当前进程退出之后**才能覆盖 EXE（Windows 不允许覆盖运行中的文件），
+       所以用 -ExecutionPolicy Bypass + 独立进程启动，脚本自己轮询等 PID 消失。
+       路径用单引号字面量，避免中文/空格被破坏。
+    """
+    global UPDATE_JOB
+    with UPDATE_LOCK:
+        d = dict(UPDATE_JOB)
+    if d["stage"] != "done" or not d["path"] or not os.path.exists(d["path"]):
+        return 400, {"error": "没有已下载并校验通过的安装包"}
+    if not getattr(sys, "frozen", False):
+        return 400, {"error": "源码运行模式不能自替换，请手动替换 EXE"}
+    exe = os.path.abspath(sys.argv[0])
+    if not exe.lower().endswith(".exe"):
+        return 400, {"error": "当前不是 EXE 启动"}
+    low = os.path.dirname(exe).lower().rstrip("\\/")
+    if low.startswith((r"c:\program files", r"c:\program files (x86)")):
+        return 400, {"error": "程序在 Program Files 下，权限不足，请手动替换"}
+    if _rc_busy() or _seg_busy():
+        return 409, {"error": "还有录制或分段任务在跑，完成后再更新"}
+    script = os.path.join(UPDATE_DIR, "apply.ps1")
+    body = _update_apply_script(exe, d["path"], os.getpid())
+    try:
+        with open(script, "w", encoding="utf-8-sig") as f:
+            f.write(body)
+        creation = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+        subprocess.Popen(["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass",
+                          "-File", script], creationflags=creation,
+                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL, close_fds=True)
+    except Exception as e:
+        return 500, {"error": "启动更新脚本失败：%s" % str(e)[:150]}
+    with UPDATE_LOCK:
+        UPDATE_JOB["stage"] = "applying"
+    threading.Thread(target=rc_quit_async, args=("更新应用",), daemon=True).start()
+    return 200, {"ok": True}
+
+
+# ---------------------------------------------------------------- 反馈 / 错误上报
+# 方案取舍（成本 / 可行性 / 隐私）：
+#   · GitHub Issues：零后端，但要求用户有 GH 账号、内容公开、还要能贴日志 →
+#     门槛高、隐私风险最大，只做成「引导用户自己去提」的次要入口；
+#   · 在线表单/腾讯文档：要账号、要维护表格、还要配 CORS 或中转 → 成本不低；
+#   · 本机 JSONL + 可选 webhook：零依赖、离线可用、默认不出网 → 选它。
+# 默认只写 `data/feedback/feedback-YYYYMM.jsonl`；`data/feedback.json` 里配了
+# `{"webhook": "https://..."}` 才会额外 POST 一份（企业微信/飞书/Slack 的机器人地址都能接）。
+FEEDBACK_DIR = os.path.join(ROOT, "data", "feedback")
+FEEDBACK_ATTACH = os.path.join(FEEDBACK_DIR, "attach")
+FEEDBACK_CONF = os.path.join(ROOT, "data", "feedback.json")
+FEEDBACK_KINDS = ("bug", "idea", "other")
+FEEDBACK_MAX = 4000
+FEEDBACK_FIELD_MAX = 2000
+# 只收这些诊断字段：**不碰** SESSDATA / Cookie / 完整路径。多收一个字段就多一分隐私风险。
+FEEDBACK_FIELDS = ("app", "version", "build", "view", "station", "ua",
+                   "platform", "screen", "errors", "theme", "lang", "zoom", "route")
+# 默认收集地址：ntfy.sh 的一个**私有主题**（随机串，等同口令，没订阅就收不到）。
+# 想换成自己的服务器：data/feedback.json 里写 {"upload_url": "https://..."}；
+# 关掉默认上传：{"upload": false}（提交后会直接打开保存文件夹）。
+FEEDBACK_UPLOAD_URL = "https://ntfy.sh/rr-fb-2a7c41d9e6b35f80"
+FEEDBACK_UPLOAD_ON = True
+FEEDBACK_IMG_MAX = 3
+FEEDBACK_IMG_BYTES = 4 * 1024 * 1024
+FEEDBACK_LOG_LINES = 120
+
+
+def _feedback_conf():
+    try:
+        with open(FEEDBACK_CONF, encoding="utf-8") as f:
+            d = json.load(f)
+    except Exception:
+        return {}
+    return d if isinstance(d, dict) else {}
+
+
+def _feedback_target():
+    """收集地址与是否默认上传。配置写坏了就退回内置的默认值，功能不能因此不可用。"""
+    c = _feedback_conf()
+    url = str(c.get("upload_url") or c.get("webhook") or FEEDBACK_UPLOAD_URL).strip()
+    if not url.startswith("https://"):
+        url = FEEDBACK_UPLOAD_URL
+    on = c.get("upload")
+    if not isinstance(on, bool):
+        on = FEEDBACK_UPLOAD_ON
+    return {"upload": on, "url": url}
+
+
+def _feedback_host(url):
+    try:
+        return urllib.parse.urlparse(url).hostname or url
+    except Exception:
+        return url
+
+
+def _feedback_context(ctx):
+    out = {}
+    if not isinstance(ctx, dict):
+        return out
+    for k in FEEDBACK_FIELDS:
+        v = ctx.get(k)
+        if v in (None, ""):
+            continue
+        if isinstance(v, list):
+            out[k] = [str(x)[:200] for x in v[:5]]
+        else:
+            out[k] = str(v)[:300]
+    return out
+
+
+def _feedback_log_tail():
+    """日志末尾若干行。凭据一律先涂掉 —— 反馈是要发出去的，不能夹带 SESSDATA。"""
+    p = os.path.join(APPDIR, "log.txt")
+    try:
+        with open(p, encoding="utf-8", errors="replace") as f:
+            lines = f.readlines()[-FEEDBACK_LOG_LINES:]
+    except Exception:
+        return []
+    out = []
+    for ln in lines:
+        x = ln.rstrip("\n")
+        x = re.sub(r"(?i)(SESSDATA|bili_jct|cookie)\s*[=:]\s*\S+", r"\1=***", x)
+        x = re.sub(r"[A-Za-z]:\\Users\\[^\\\s]+", r"<user>", x)
+        out.append(x[:400])
+    return out
+
+
+def _feedback_norm(rec):
+    """兼容 v1.9.26 的旧记录（当时叫 text、图片是磁盘路径），统一成内部结构。"""
+    return {
+        "id": str(rec.get("id") or ""),
+        "at": int(rec.get("at") or time.time()),
+        "kind": str(rec.get("kind") or "other"),
+        "summary": str(rec.get("summary") or rec.get("text") or ""),
+        "steps": str(rec.get("steps") or ""),
+        "trigger": str(rec.get("trigger") or ""),
+        "actual": str(rec.get("actual") or ""),
+        "expected": str(rec.get("expected") or ""),
+        "context": rec.get("context") if isinstance(rec.get("context"), dict) else {},
+        "logs": rec.get("logs") if isinstance(rec.get("logs"), list) else [],
+        "images": rec.get("images") if isinstance(rec.get("images"), list) else [],
+    }
+
+
+def _feedback_images(images):
+    """把前端压好的 dataURL 收进文档本身（base64），不再单独落盘。
+
+    以前截图放在 attach/<编号>/ 下、md 里写相对路径，结果是「一条反馈三个文件」，
+    转发时经常只带走 md、图丢了。现在图片就是文档里的一个字段。
+    """
+    out = []
+    if not isinstance(images, list):
+        return out
+    for i, im in enumerate(images[:FEEDBACK_IMG_MAX]):
+        if not isinstance(im, dict):
+            continue
+        raw = str(im.get("data") or "")
+        mime = str(im.get("type") or "")
+        if raw.startswith("data:") and "," in raw:
+            head, raw = raw.split(",", 1)
+            mime = head[5:].split(";")[0] or mime
+        try:
+            blob = base64.b64decode(raw, validate=False)
+        except Exception:
+            continue
+        ext = {"image/png": "png", "image/jpeg": "jpg",
+               "image/webp": "webp", "image/gif": "gif"}.get(mime)
+        if not blob or not ext or len(blob) > FEEDBACK_IMG_BYTES:
+            continue
+        out.append({"name": "shot-%d.%s" % (i + 1, ext), "type": mime,
+                    "size": len(blob),
+                    "sha256": hashlib.sha256(blob).hexdigest()[:16],
+                    "data": "data:%s;base64,%s"
+                            % (mime, base64.b64encode(blob).decode("ascii"))})
+    return out
+
+
+def _feedback_md(rec):
+    """人读版正文（作为文档的 markdown 字段，不再单独写 .md 文件）。"""
+    c = rec.get("context") or {}
+    lines = ["# 反馈 %s" % rec.get("id"), "",
+             "- 时间：%s" % time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(rec["at"])),
+             "- 类型：%s" % rec.get("kind"), ""]
+    for label, key in (("概述", "summary"), ("复现步骤", "steps"),
+                       ("触发条件", "trigger"), ("异常表现", "actual"),
+                       ("期望结果", "expected")):
+        v = (rec.get(key) or "").strip()
+        if v:
+            lines += ["## " + label, "", v, ""]
+    lines += ["## 环境", "", "```json",
+              json.dumps(c, ensure_ascii=False, indent=2), "```", ""]
+    logs = rec.get("logs") or []
+    if logs:
+        lines += ["## 日志末尾（%d 行，已涂掉凭据）" % len(logs), "", "```", *logs, "```", ""]
+    imgs = rec.get("images") or []
+    if imgs:
+        lines += ["## 截图（已内嵌在 images 字段）", ""]
+        for im in imgs:
+            lines.append("- `%s`（%d KB，sha256 %s）"
+                         % (im.get("name"), int(im.get("size") or 0) // 1024,
+                            im.get("sha256")))
+        lines.append("")
+    return "\n".join(lines)
+
+
+def _feedback_document(rec):
+    """一条反馈 = 一个自包含文档：正文、环境、日志、截图全在里面。
+
+    上传时**原样发送这个 JSON**，接收端不需要再去别处找附件；
+    markdown 字段是同一份内容的人读版，方便直接贴进 Issue。
+    """
+    ctx = rec.get("context") or {}
+    return {
+        "schema": "replay-radio-feedback",
+        "schema_version": 1,
+        "id": rec["id"],
+        "created_at": rec["at"],
+        "created_at_local": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(rec["at"])),
+        "app": "ReplayRadio",
+        "version": str(ctx.get("version") or ""),
+        "build": str(ctx.get("build") or ""),
+        "kind": rec["kind"],
+        "report": {
+            "summary": rec.get("summary") or "",
+            "steps": rec.get("steps") or "",
+            "trigger": rec.get("trigger") or "",
+            "actual": rec.get("actual") or "",
+            "expected": rec.get("expected") or "",
+        },
+        "environment": ctx,
+        "logs": {"source": "log.txt", "lines": rec.get("logs") or []},
+        "images": rec.get("images") or [],
+        "markdown": _feedback_md(rec),
+    }
+
+
+def _feedback_write(doc):
+    """写 `<编号>.json`。先写 .part 再替换，避免用户恰好在这时打开看到半个文件。"""
+    os.makedirs(FEEDBACK_DIR, exist_ok=True)
+    path = os.path.join(FEEDBACK_DIR, doc["id"] + ".json")
+    tmp = path + ".part"
+    with open(tmp, "w", encoding="utf-8", newline="\n") as f:
+        json.dump(doc, f, ensure_ascii=False, indent=2)
+        f.write("\n")
+    os.replace(tmp, path)
+    return path
+
+
+def _feedback_summary(doc):
+    """给推送通道看的纯文本：一条消息就能读懂「什么问题、怎么复现、什么环境」。"""
+    rep = doc.get("report") or {}
+    c = doc.get("environment") or {}
+    bits = ["[%s] %s" % (doc.get("kind"), rep.get("summary") or "(无概述)")]
+    for label, key in (("复现", "steps"), ("触发", "trigger"),
+                       ("异常", "actual"), ("期望", "expected")):
+        v = (rep.get(key) or "").strip()
+        if v:
+            bits.append(label + ": " + v.replace("\n", " / ")[:300])
+    env = " · ".join(x for x in (
+        ("v" + str(doc.get("version") or "")).strip("v"),
+        str(doc.get("build") or ""),
+        str(c.get("view") or ""),
+        str(c.get("station") or ""),
+        str(c.get("screen") or ""),
+        str(c.get("platform") or "")) if x)
+    if env:
+        bits.append("环境: " + env)
+    errs = c.get("errors") or []
+    if errs:
+        bits.append("最近报错: " + " | ".join(str(e)[:120] for e in errs[:3]))
+    bits.append("截图: %d 张 · 文档 %s.json · 编号 %s"
+                % (len(doc.get("images") or []), doc.get("id"), doc.get("id")))
+    return "\n".join(bits)[:3500]
+
+
+def _feedback_upload(doc):
+    """把**这个单一文档**发到配置的收集地址。
+
+    · ntfy.sh：先发可读摘要（推送里能直接看），再把整份 JSON 作为**一个附件**上传；
+    · 其他 HTTPS 地址：直接 POST 这份 JSON 的原始字节。
+    无论哪条通道，接收方拿到的都是同一个自包含文件，不用再拼 md / 图片。
+    """
+    t = _feedback_target()
+    url = t["url"]
+    host = _feedback_host(url)
+    is_ntfy = host.endswith("ntfy.sh")
+    raw = json.dumps(doc, ensure_ascii=False, indent=2).encode("utf-8")
+    name = "FB-%s.json" % doc.get("id")
+    out = {"ok": False, "target": host, "at": int(time.time()),
+           "document": name, "bytes": len(raw)}
+    try:
+        if is_ntfy:
+            req = urllib.request.Request(
+                url, data=_feedback_summary(doc).encode("utf-8"), method="POST",
+                headers={"User-Agent": UA, "Content-Type": "text/plain; charset=utf-8",
+                         "Title": "ReplayRadio feedback", "Tags": "speech_balloon",
+                         "Priority": "default"})
+            with urlopen(req, 15) as r:
+                out["status"] = getattr(r, "status", 200)
+            out["ok"] = 200 <= int(out.get("status") or 0) < 300
+            req2 = urllib.request.Request(url, data=raw, method="PUT", headers={
+                "User-Agent": UA, "Filename": name,
+                "Title": "ReplayRadio feedback document", "Tags": "page_facing_up"})
+            with urlopen(req2, 25) as r2:
+                out["doc_status"] = getattr(r2, "status", 200)
+            out["ok"] = bool(out["ok"]) and 200 <= int(out.get("doc_status") or 0) < 300
+        else:
+            req = urllib.request.Request(
+                url, data=raw,
+                headers={"Content-Type": "application/json; charset=utf-8",
+                         "User-Agent": UA, "X-Feedback-Id": str(doc.get("id") or "")})
+            with urlopen(req, 25) as r:
+                out["status"] = getattr(r, "status", 200)
+            out["ok"] = 200 <= int(out.get("status") or 0) < 300
+    except Exception as e:
+        out["error"] = str(e)[:160]
+    return out
+
+
+def _feedback_migrate_legacy():
+    """把 v1.9.27 及更早的「jsonl + md + attach」并成一条一个 JSON。
+
+    旧文件不删，整批移到 `legacy/`（可逆、可回溯）；新文档写完才移动，
+    中途失败最多留下旧文件，不会丢反馈。
+    """
+    try:
+        names = os.listdir(FEEDBACK_DIR)
+    except OSError:
+        return
+    olds = [n for n in names if n.startswith("feedback-") and n.endswith(".jsonl")]
+    if not olds and not any(n in names for n in ("attach", "upload-state.json")):
+        return
+    made = 0
+    for n in olds:
+        try:
+            fh = open(os.path.join(FEEDBACK_DIR, n), encoding="utf-8")
+        except OSError:
+            continue
+        with fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = _feedback_norm(json.loads(line))
+                except ValueError:
+                    continue
+                if not rec["id"]:
+                    continue
+                dst = os.path.join(FEEDBACK_DIR, rec["id"] + ".json")
+                if os.path.exists(dst):
+                    continue
+                # 旧记录的图片只存了路径：读回来嵌进文档，再丢掉路径字段
+                fixed = []
+                for im in rec["images"]:
+                    if not isinstance(im, dict):
+                        continue
+                    item = dict(im)
+                    if not item.get("data") and item.get("path"):
+                        try:
+                            with open(os.path.join(ROOT, str(item["path"]).replace("/", os.sep)),
+                                      "rb") as f:
+                                blob = f.read()
+                            item["data"] = "data:%s;base64,%s" % (
+                                item.get("type") or "image/jpeg",
+                                base64.b64encode(blob).decode("ascii"))
+                            item["size"] = len(blob)
+                        except OSError:
+                            pass
+                    item.pop("path", None)
+                    fixed.append(item)
+                rec["images"] = fixed
+                try:
+                    _feedback_write(_feedback_document(rec))
+                    made += 1
+                except OSError:
+                    pass
+    legacy = os.path.join(FEEDBACK_DIR, "legacy")
+    try:
+        os.makedirs(legacy, exist_ok=True)
+    except OSError:
+        return
+    for n in names:
+        if n == "legacy":
+            continue
+        if not (n.startswith("feedback-") and n.endswith(".jsonl")) \
+                and not n.endswith(".md") and n not in ("attach", "upload-state.json"):
+            continue
+        try:
+            shutil.move(os.path.join(FEEDBACK_DIR, n), os.path.join(legacy, n))
+        except Exception:
+            pass
+    print("[feedback] 旧反馈已合并为单文档：新增 %d 个 JSON，旧文件在 data/feedback/legacy/" % made)
+
+
+def _feedback_find(fid):
+    """按编号取回文档（一键上传 / 打开文件夹用）。旧的 jsonl 会顺手迁移。"""
+    if not re.fullmatch(r"[0-9]{8}-[0-9]{6}-[0-9a-f]{6}", str(fid or "")):
+        return None
+    path = os.path.join(FEEDBACK_DIR, str(fid) + ".json")
+    if not os.path.exists(path):
+        _feedback_migrate_legacy()
+    try:
+        with open(path, encoding="utf-8") as f:
+            d = json.load(f)
+        return d if isinstance(d, dict) else None
+    except (OSError, ValueError):
+        return None
+
+
+def _feedback_reveal(fid=""):
+    """在资源管理器里定位到这份反馈文档（Windows）；其他平台只回路径。"""
+    path = os.path.join(FEEDBACK_DIR, (str(fid) + ".json") if fid else "")
+    if not fid or not os.path.exists(path):
+        path = FEEDBACK_DIR
+    try:
+        os.makedirs(FEEDBACK_DIR, exist_ok=True)
+    except OSError:
+        pass
+    # 自动化验收用：只回路径，不真的弹窗（CI/截图时不该抢焦点）
+    if os.environ.get("REPLAY_NO_REVEAL") == "1":
+        return {"ok": True, "suppressed": True,
+                "path": os.path.relpath(path, ROOT).replace("\\", "/")}
+    if os.name != "nt":
+        return {"ok": False, "path": os.path.relpath(path, ROOT).replace("\\", "/")}
+    try:
+        if os.path.isfile(path):
+            subprocess.Popen(["explorer", "/select,", os.path.normpath(path)])
+        else:
+            subprocess.Popen(["explorer", os.path.normpath(path)])
+        return {"ok": True, "path": os.path.relpath(path, ROOT).replace("\\", "/")}
+    except Exception as e:
+        return {"ok": False, "error": str(e)[:80],
+                "path": os.path.relpath(path, ROOT).replace("\\", "/")}
+
+
+def api_feedback_conf():
+    _feedback_migrate_legacy()
+    t = _feedback_target()
+    return 200, {"upload": t["upload"], "target": _feedback_host(t["url"]),
+                 "url": t["url"] if t["upload"] else ""}
+
+
+def api_feedback(obj):
+    _feedback_migrate_legacy()      # 提交前先并一次旧文件，避免新旧格式混在目录里
+    kind = str(obj.get("kind") or "other")
+    if kind not in FEEDBACK_KINDS:
+        kind = "other"
+    txt = {k: str(obj.get(k) or "").strip()[:FEEDBACK_FIELD_MAX]
+           for k in ("text", "steps", "trigger", "actual", "expected")}
+    if len(txt["text"]) + len(txt["steps"]) + len(txt["actual"]) < 4:
+        return 400, {"error": "请至少写一句概述，或填一下现象 / 复现步骤"}
+    if len(txt["text"]) > FEEDBACK_MAX:
+        return 400, {"error": "概述最多 %d 字" % FEEDBACK_MAX}
+    fid = time.strftime("%Y%m%d-%H%M%S") + "-" + os.urandom(3).hex()
+    ctx = _feedback_context(obj.get("context"))
+    rec = {
+        "id": fid,
+        "at": int(time.time()),
+        "kind": kind,
+        "summary": txt["text"],
+        "steps": txt["steps"],
+        "trigger": txt["trigger"],
+        "actual": txt["actual"],
+        "expected": txt["expected"],
+        "context": ctx,
+        # 有诊断信息才带日志：用户明确关掉诊断时不该偷偷收集日志
+        "logs": _feedback_log_tail() if ctx else [],
+        "images": _feedback_images(obj.get("images")),
+    }
+    doc = _feedback_document(rec)
+    try:
+        path = _feedback_write(doc)
+    except OSError as e:
+        return 500, {"error": "写入本机失败：%s" % str(e)[:80]}
+    out = {"ok": True, "id": fid,
+           "stored": os.path.relpath(path, ROOT).replace("\\", "/"),
+           "dir": "data/feedback",
+           "images": len(doc["images"])}
+    t = _feedback_target()
+    want = obj.get("upload")
+    do_up = t["upload"] if not isinstance(want, bool) else want
+    if do_up:
+        res = _feedback_upload(doc)
+        out["upload"] = res
+        doc["upload"] = {"at": res.get("at"), "ok": bool(res.get("ok")),
+                         "target": res.get("target"), "document": res.get("document"),
+                         "error": res.get("error", "")}
+        try:
+            _feedback_write(doc)
+        except OSError:
+            pass
+        if not res.get("ok"):
+            out["warn"] = "已保存到本机，但上传失败：%s" % (res.get("error") or "对方未接受")
+    else:
+        # 明确不上传：直接把保存位置弹出来，省得用户去翻 data 目录
+        out["reveal"] = _feedback_reveal(fid)
+    return 200, out
+
+
+def api_feedback_upload(obj):
+    """一键（重新）上传：按编号取回文档，原样再发一次。"""
+    doc = _feedback_find(obj.get("id"))
+    if not doc:
+        return 404, {"error": "找不到这条反馈（编号不对或文件已被移走）"}
+    res = _feedback_upload(doc)
+    doc["upload"] = {"at": res.get("at"), "ok": bool(res.get("ok")),
+                     "target": res.get("target"), "document": res.get("document"),
+                     "error": res.get("error", "")}
+    try:
+        _feedback_write(doc)
+    except OSError:
+        pass
+    return (200 if res.get("ok") else 502), {"ok": bool(res.get("ok")),
+                                             "id": doc.get("id"), **res}
+
+
+def api_feedback_reveal(obj):
+    return 200, _feedback_reveal(str(obj.get("id") or ""))
 
 
 # B 站风控：请求太密会回 412（响应体 code=-412「request was banned」），持续几十分钟。
@@ -2297,6 +3044,34 @@ def _rc_room_info(room):
             "living": int(x.get("live_status") or 0) == 1,
             "area": (parent + " · " + area) if (parent and area) else (area or parent),
             "cover": x.get("keyframe") or x.get("user_cover") or ""}
+
+
+_BRIEF = {}          # room -> {"at": ts, "d": {...}}：顶栏那行小字，30 秒够新鲜
+
+
+def api_live_brief():
+    """当前主播的「直播简报」：在播与否 + 标题。给顶栏选择器显示，不进主状态面板。
+
+    房间信息接口本身就带标题，一次请求就够；失败时给上一次结果并标注 stale，
+    顶栏那行字退化成一居「状态未知」，但不该因此报错刷屏。
+    """
+    room = cur_room()
+    now = time.time()
+    c = _BRIEF.get(room)
+    if c and now - c["at"] < 30:
+        return 200, c["d"]
+    try:
+        info = _rc_room_info(room)
+        d = {"room": room, "living": bool(info.get("living")),
+             "title": info.get("title") or "", "area": info.get("area") or "",
+             "at": int(now)}
+    except Exception as e:
+        if c:
+            return 200, dict(c["d"], stale=True, error=str(e)[:80])
+        return 200, {"room": room, "living": False, "title": "",
+                     "error": str(e)[:80], "at": int(now)}
+    _BRIEF[room] = {"at": now, "d": d}
+    return 200, d
 
 
 def _rc_master(uid):
@@ -4296,18 +5071,196 @@ def _danmaku_ready():
     return bool(sess and jct)
 
 
-def _send_danmaku(msg, room):
-    """发一条弹幕，返回 (B 站 code, message)。code=0 才是成功。"""
+# ---------------------------------------------------------------- 直播间表情
+# B 站直播的表情分三类：通用（official_*）/ UP 主大表情 / 房间专属（room_*）。
+# 面板数据来自 GetEmoticons；发送**不能**走普通文字通道（发出去只会变成一串文字），
+# 要用 dm_type=1 + msg=emoticon_unique + emoticonOptions（url/宽高）。
+# 本地还支持一个可替换的表情包清单（assets/emoticons/packs.json），
+# 接口取不到/离线时至少还有它。
+LIVE_EMOTE_API = "https://api.live.bilibili.com/xlive/web-ucenter/v2/emoticon/GetEmoticons"
+LIVE_EMOTE_TTL = 600
+LIVE_EMOTE = {}
+LIVE_EMOTE_LOCK = threading.Lock()
+LOCAL_EMOTE_FILE = os.path.join(ROOT, "assets", "emoticons", "packs.json")
+
+
+def _emote_item(e):
+    url = str(e.get("url") or "").strip()
+    if url.startswith("//"):
+        url = "https:" + url
+    url = url.replace("http://", "https://")
+    return {
+        "u": str(e.get("emoticon_unique") or ""),
+        "name": str(e.get("emoji") or e.get("descript") or ""),
+        "url": url,
+        "w": int(e.get("width") or 0),
+        "h": int(e.get("height") or 0),
+        "bulge": int(e.get("bulge_display") or 0),
+        "perm": int(e.get("perm") or 0),
+        "need_level": int(e.get("unlock_need_level") or 0),
+        "need_gift": int(e.get("unlock_need_gift") or 0),
+        "unlock": str(e.get("unlock_show_text") or ""),
+    }
+
+
+def _local_emote_packs():
+    """可替换的本地表情包（读不到就当没有，不影响功能）。
+
+    文件格式：
+      {"packs":[{"id":"my","name":"我的表情","emoticons":[
+          {"unique":"my_1","name":"开心","url":"happy.png","width":120,"height":120}]}]}
+    `url` 写相对路径时按 assets/emoticons/ 解析；也可以直接写 http(s) 地址。
+    """
+    try:
+        with open(LOCAL_EMOTE_FILE, encoding="utf-8") as f:
+            d = json.load(f)
+    except Exception:
+        return []
+    packs = []
+    for p in (d.get("packs") or []):
+        items = []
+        for e in (p.get("emoticons") or []):
+            u = str(e.get("unique") or "").strip()
+            if not u:
+                continue
+            url = str(e.get("url") or "").strip()
+            if url and not url.startswith(("http://", "https://", "/")):
+                url = "/assets/emoticons/" + url.lstrip("./")
+            items.append({"u": u, "name": str(e.get("name") or ""), "url": url,
+                          "w": int(e.get("width") or 0), "h": int(e.get("height") or 0),
+                          "bulge": 0, "perm": 1, "need_level": 0, "need_gift": 0,
+                          "unlock": ""})
+        if items:
+            packs.append({"id": str(p.get("id") or p.get("name") or "local"),
+                          "name": str(p.get("name") or "本地表情"), "type": 0,
+                          "items": items})
+    return packs
+
+
+def _live_emote_fetch(room):
+    """从 B 站取当前直播间的表情包（需要登录态才会有房间专属那一包）。"""
+    hdrs = {
+        "User-Agent": UA,
+        "Referer": "https://live.bilibili.com/%s" % room,
+        "Accept": "application/json, text/plain, */*",
+    }
+    sess = load_credentials()[0]
+    if sess:
+        hdrs["Cookie"] = "SESSDATA=%s" % sess
+    url = "%s?platform=pc&room_id=%s" % (LIVE_EMOTE_API, urllib.parse.quote(str(room)))
+    with cached_get(url, hdrs, timeout=15) as r:
+        status = getattr(r, "status", 200)
+        body = r.read()
+    if status >= 400:
+        raise RuntimeError("HTTP %d" % status)
+    d = json.loads(body.decode("utf-8", "replace"))
+    if d.get("code") != 0:
+        raise RuntimeError("code=%s %s" % (d.get("code"), d.get("message")))
+    packs = []
+    for p in ((d.get("data") or {}).get("data") or []):
+        items = [_emote_item(e) for e in (p.get("emoticons") or [])]
+        items = [x for x in items if x["u"] and x["url"]]
+        if items:
+            packs.append({"id": str(p.get("pkg_id") or ""),
+                          "name": str(p.get("pkg_name") or ""),
+                          "type": int(p.get("pkg_type") or 0), "items": items})
+    return packs
+
+
+def live_emote_packs(force=False, room=None):
+    """**指定房间**的表情包（10 分钟缓存；失败时 30 秒后允许重试）。
+
+    room 为空才回落到当前主播的房间。监控室聚焦某一路时必须传那一路的 room：
+    表情包（尤其粉丝牌表情）是跟房间走的，拿主站主播的包去发别的房间，
+    轻则提示「不在表情包里」，重则发出去跟预期不一致。
+
+    ⚠️ 失败不抛给前端：至少把本地包给出去，面板不该整块空掉。
+    """
+    room = str(room or "").strip() or cur_room()
+    now = time.time()
+    with LIVE_EMOTE_LOCK:
+        hit = LIVE_EMOTE.get(room)
+        if hit and not force:
+            ttl = LIVE_EMOTE_TTL if hit["remote"] else 30
+            if now - hit["at"] < ttl:
+                return hit
+    remote, err = [], ""
+    try:
+        remote = _live_emote_fetch(room)
+    except Exception as e:
+        err = str(e)[:120]
+    packs = remote + _local_emote_packs()
+    out = {"at": now, "packs": packs, "remote": bool(remote), "error": err}
+    with LIVE_EMOTE_LOCK:
+        LIVE_EMOTE[room] = out
+    return out
+
+
+def api_live_emoticons(force=False, room=""):
+    room = str(room or "").strip()
+    d = live_emote_packs(force, room or None)
+    body = {"room": room or cur_room(), "packs": d["packs"],
+            "source": "bili" if d["remote"] else ("local" if d["packs"] else "none")}
+    if d["error"]:
+        body["error"] = d["error"]
+    return 200, body
+
+
+def _live_emote_find(unique, room=""):
+    """按 emoticon_unique 找表情（发之前必须校验：不能把任意 url 塞给 B 站）。
+
+    先查目标房间的包，再查当前主播的包 —— 用户可能刚从「直播间」那边拿到的表情，
+    两个包内容一致时都能命中；不一致时以目标房间为准。
+    """
+    u = str(unique or "").strip()
+    if not u:
+        return None
+    packs = list(live_emote_packs(room=room or None)["packs"])
+    if str(room or "").strip() and str(room).strip() != str(cur_room()):
+        packs += list(live_emote_packs()["packs"])
+    for p in packs:
+        for it in p["items"]:
+            if it["u"] != u:
+                continue
+            # 只有 B 站自己的图能作为表情素材发给 B 站
+            if not re.match(r"^https://[\w.-]*hdslb\.com/", it["url"] or ""):
+                return None
+            return it
+    return None
+
+
+def _send_danmaku(msg, emote=None, room=None):
+    """发一条弹幕，返回 (B 站 code, message)。code=0 才是成功。
+
+    emote 不为空时走**表情通道**：B 站把大表情/房间表情当独立类型，
+    普通文字通道发出去只会显示成一串文字（实测「不能用 [表情名] 兜底」）。
+    room：监控室聚焦面板要发给「当前那一路」，不传则跟当前板块。
+    """
     _, jct = load_credentials()
-    body = urllib.parse.urlencode({
+    target = str(room or cur_room())
+    fields = {
         "bubble": "0", "msg": msg, "color": "16777215", "mode": "1",
-        "fontsize": "25", "roomid": room, "rnd": str(int(time.time())),
+        "fontsize": "25", "roomid": target, "rnd": str(int(time.time())),
         "csrf": jct, "csrf_token": jct,
-    }).encode("utf-8")
+    }
+    if emote:
+        fields.update({
+            "dm_type": "1",
+            "msg": emote["u"],
+            "emoticonOptions": json.dumps({
+                "bulge_display": int(emote.get("bulge") or 0),
+                "emoticon_unique": emote["u"],
+                "height": int(emote.get("h") or 40),
+                "width": int(emote.get("w") or 40),
+                "in_player_area": 1,
+                "url": emote["url"],
+            }, ensure_ascii=False),
+        })
+    body = urllib.parse.urlencode(fields).encode("utf-8")
     sess = load_credentials()[0]
     req = urllib.request.Request("https://api.live.bilibili.com/msg/send", data=body, headers={
         "User-Agent": UA,
-        "Referer": "https://live.bilibili.com/%s" % room,
+        "Referer": "https://live.bilibili.com/%s" % target,
         "Origin": "https://live.bilibili.com",
         "Content-Type": "application/x-www-form-urlencoded",
         "Cookie": "SESSDATA=%s; bili_jct=%s" % (sess, jct),
@@ -4456,6 +5409,23 @@ def reward_send(obj):
 
 
 def api_live_send(obj):
+    room = str(obj.get("room") or "").strip()
+    if room and not room.isdigit():
+        return 400, {"error": "房间号不合法"}
+    em = obj.get("emoticon")
+    if em is not None:
+        if not isinstance(em, dict):
+            return 400, {"error": "表情参数不合法"}
+        item = _live_emote_find(em.get("unique"), room)
+        if not item:
+            return 404, {"error": "这个表情不在当前直播间的表情包里（可能已下架或没有权限）"}
+        if int(item.get("perm") or 0) != 1:
+            return 403, {"error": "这个表情当前不可发送"}
+        if not _danmaku_ready():
+            return 403, {"error": "发弹幕需要登录，并粘贴 bili_jct（直播间页右侧有入口）"}
+        code, message = _send_danmaku("", item, room or None)
+        return (200 if code == 0 else 502), {"code": code, "message": message,
+                                             "emoticon": item["u"]}
     msg = str(obj.get("msg") or "").strip()
     if not msg:
         return 400, {"error": "弹幕内容不能为空"}
@@ -4463,7 +5433,7 @@ def api_live_send(obj):
         return 400, {"error": "弹幕最长 %d 个字（当前 %d 个）" % (DANMAKU_MAX_LEN, len(msg))}
     if not _danmaku_ready():
         return 403, {"error": "发弹幕需要登录，并粘贴 bili_jct（直播间页右侧有入口）"}
-    code, message = _send_danmaku(msg, cur_room())
+    code, message = _send_danmaku(msg, None, room or None)
     return (200 if code == 0 else 502), {"code": code, "message": message}
 
 
@@ -4481,7 +5451,7 @@ def _wheel_worker(room):
     fails = 0
     try:
         while st["sent"] < st["total"] and not st["stop"].is_set():
-            code, message = _send_danmaku(st["msg"], room)
+            code, message = _send_danmaku(st["msg"], room=room)
             st["last_code"], st["last_message"] = code, message
             if code == 0:
                 st["sent"] += 1
@@ -4686,7 +5656,12 @@ def _fill_live_stream(out, room, qn):
 #    再往上只会把风控窗口撑长（代价比省下的几百毫秒大得多）。
 FOLLOWING_API = "https://api.bilibili.com/x/relation/followings"
 FOLLOW_PAGE = 50                 # 每页条数（接口上限）
-FOLLOW_PAGE_MAX = 60             # 最多翻 60 页 = 3000 个关注（防呆上限）
+# 防跑飞上限，不是业务上限：实际页数由第一页返回的 total 决定。
+# 60 页（3000）曾经是硬截断，4837 个关注里有 1837 人从来没被查过 ——
+# 在播人数天生少算一截，还查不出原因（只在日志里写「3000 人」）。
+# 400 页 = 20000 个关注，正常账号远远够用。
+FOLLOW_PAGE_MAX = 400
+FOLLOW_PAGE_RETRY = 2            # 单页失败重试次数（0.6s / 1.2s 退避）
 # 开播状态一次带多少个 uid。对照实验（2026-10-13，同一批 150 个 uid）：
 # 3×50 与 1×150 返回的条目、在播集合**完全一致** → 放大批次不丢人，
 # 但请求数从 32 降到 11（1588 个关注）。⚠️ 别只看「返回条数 < 请求条数」就
@@ -4698,7 +5673,10 @@ FOLLOW_UIDS_TTL = 1800           # 关注关系变化很慢，uid 名单缓存�
 # 落盘缓存：进程重启后第一次进监控室也不必干等（实测冷启动约 1.2 秒）。
 # 超过这个时长就当作没有 —— 半年前的名单没有意义。
 FOLLOW_DISK = os.path.join(ROOT, "data", "follow_cache.json")
-FOLLOW_DISK_TTL = 86400
+# 落盘缓存只负责「刚重启就有一份东西可画」。在播名单是会过期的：晚上 88 位、
+# 次日白天只剩 36 位是正常现象，所以最多认一小时 —— 之前给 24 小时，
+# 结果 20 小时前的名单被当成「当前在播」，格子里全写着「未开播」。
+FOLLOW_DISK_TTL = 3600
 FOLLOW_CACHE = {"at": 0.0, "list": [], "uids": [], "uids_at": 0.0, "busy": False,
                 "disk_tried": False}
 FOLLOW_LOCK = threading.Lock()
@@ -4732,24 +5710,58 @@ def _follow_json(url, referer):
 
 
 def _follow_page(uid, pn):
-    """翻一页，返回 uid 列表；取不到返回 None（由调用方判断是整体失败还是留旧数据）。"""
-    try:
-        d = _follow_json("%s?vmid=%s&pn=%d&ps=%d" % (FOLLOWING_API, uid, pn, FOLLOW_PAGE),
-                         REFERER)
-    except Exception as e:
-        print("[follow] 第 %d 页取失败：%s" % (pn, e))
-        return None
-    if d.get("code") != 0:
-        print("[follow] 第 %d 页 code=%s %s" % (pn, d.get("code"), d.get("message")))
-        return None
-    return [str(u.get("mid")) for u in ((d.get("data") or {}).get("list") or [])
-            if u.get("mid")]
+    """翻一页，返回 uid 列表；取不到返回 None。
+
+    单页失败先退避重试（网络抖动 / 瞬时 412）。`code != 0` 不重试 ——
+    那是账号级风控或参数错，重试只会把风控窗口撑长。
+    """
+    for attempt in range(FOLLOW_PAGE_RETRY + 1):
+        try:
+            d = _follow_json("%s?vmid=%s&pn=%d&ps=%d" % (FOLLOWING_API, uid, pn, FOLLOW_PAGE),
+                             REFERER)
+        except Exception as e:
+            print("[follow] 第 %d 页取失败（第 %d 次）：%s" % (pn, attempt + 1, e))
+            d = None
+        if d is not None:
+            if d.get("code") != 0:
+                print("[follow] 第 %d 页 code=%s %s" % (pn, d.get("code"), d.get("message")))
+                return None
+            return [str(u.get("mid")) for u in ((d.get("data") or {}).get("list") or [])
+                    if u.get("mid")]
+        if attempt < FOLLOW_PAGE_RETRY:
+            time.sleep(0.6 * (attempt + 1))
+    return None
 
 
-def _following_uids():
-    """关注的全部 uid（半小时缓存；翻页并发跑）。"""
+def _dedupe_uids(uids):
+    """按出现顺序去重。
+
+    翻页期间关注关系会变（用户自己取消/新增关注），同一个人可能出现在两页里；
+    不去重会让他在「在播名单」里出现两次，左栏就会重复。
+    """
+    seen = set()
+    out = []
+    for u in uids:
+        u = str(u or "").strip()
+        if not u or u in seen:
+            continue
+        seen.add(u)
+        out.append(u)
+    return out
+
+
+def _following_uids(force=False):
+    """关注的全部 uid（半小时缓存；翻页并发跑）。
+
+    页数由第一页的 `total` 决定，不再写死上限；单页失败会重试，
+    仍失败则整体抛错（缺页 = 名单不完整，宁可沿用旧数据）。
+
+    force=True 时**跳过缓存**：用户点「刷新开播状态」就是要看当前真实关注关系。
+    以前这个函数没有 force，用户刚取消关注，uid 名单还能挂 30 分钟 ——
+    再配合下面按 uid 查开播状态，那个人会继续出现在「关注的直播」里。
+    """
     now = time.time()
-    if FOLLOW_CACHE["uids"] and now - FOLLOW_CACHE["uids_at"] < FOLLOW_UIDS_TTL:
+    if not force and FOLLOW_CACHE["uids"] and now - FOLLOW_CACHE["uids_at"] < FOLLOW_UIDS_TTL:
         return FOLLOW_CACHE["uids"]
     uid = self_uid()
     if not uid:
@@ -4758,9 +5770,15 @@ def _following_uids():
     if first.get("code") != 0:
         raise RuntimeError("关注列表 code=%s %s" % (first.get("code"), first.get("message")))
     data = first.get("data") or {}
+    total = int(data.get("total") or 0)
     out = [str(u.get("mid")) for u in (data.get("list") or []) if u.get("mid")]
-    pages = min(max(1, (int(data.get("total") or 0) + FOLLOW_PAGE - 1) // FOLLOW_PAGE),
-                FOLLOW_PAGE_MAX)
+    pages = min(max(1, (total + FOLLOW_PAGE - 1) // FOLLOW_PAGE), FOLLOW_PAGE_MAX)
+    if total <= 0:
+        # 0 个关注是合法状态，不是错误
+        FOLLOW_CACHE["uids"] = []
+        FOLLOW_CACHE["uids_at"] = now
+        print("[follow] 关注名单为空")
+        return []
     if pages > 1:
         todo = list(range(2, pages + 1))
         with concurrent.futures.ThreadPoolExecutor(
@@ -4773,10 +5791,14 @@ def _following_uids():
             raise RuntimeError("关注列表有 %d/%d 页取失败（%s…）"
                                % (len(failed), pages, ", ".join(str(p) for p in failed[:5])))
         for g in got:
-            out.extend(g)
+            out.extend(g or [])
+    raw_n = len(out)
+    out = _dedupe_uids(out)
     FOLLOW_CACHE["uids"] = out
     FOLLOW_CACHE["uids_at"] = now
-    print("[follow] 关注名单 %d 人（%d 页，并发 %d）" % (len(out), pages, FOLLOW_WORKERS))
+    print("[follow] 关注名单 %d 人（total=%d、%d 页、并发 %d%s）"
+          % (len(out), total, pages, FOLLOW_WORKERS,
+             "、去重 %d 条" % (raw_n - len(out)) if raw_n != len(out) else ""))
     return out
 
 
@@ -4794,7 +5816,7 @@ def _following_people(force=False):
     if (not force and FOLLOW_PEOPLE_CACHE["list"]
             and now - FOLLOW_PEOPLE_CACHE["at"] < FOLLOW_PEOPLE_TTL):
         return list(FOLLOW_PEOPLE_CACHE["list"])
-    uids = _following_uids()
+    uids = _following_uids(force_uids)
     batches = [uids[i:i + FOLLOW_BATCH] for i in range(0, len(uids), FOLLOW_BATCH)]
 
     def one(batch):
@@ -4865,8 +5887,516 @@ def _follow_batch(batch):
     return out
 
 
-def _follow_live_fetch():
-    """同步跑完整条链：名单 → 并发查开播 → 按人气排序。"""
+# ---------------------------------------------------------------- 监控室：推荐 / 工会
+RECOMMEND_CACHE = {"at": 0.0, "area": "", "data": []}
+GUILD_SEED = os.path.join(ROOT, "assets", "guilds_seed.json")
+GUILD_USER = os.path.join(ROOT, "data", "guilds_user.json")
+_GUILD_CACHE = {}                 # name -> {"at":ts,"data":{...}}
+GUILD_CACHE_TTL = 30
+
+
+def _guild_name(n):
+    """萌娘条目名常带消歧义后缀：七海(虚拟UP主) → 七海。"""
+    return re.sub(r"[（(](虚拟UP主|虚拟主播|虚拟歌手)[)）]$", "", str(n or "")).strip()
+
+
+def _guilds_load():
+    """内置名册（随版本更新）+ 用户手动添加（data/guilds_user.json）。"""
+    out = {}
+    try:
+        with open(GUILD_SEED, encoding="utf-8") as f:
+            seed = json.load(f)
+        for g in (seed.get("guilds") or []):
+            name = str(g.get("name") or "").strip()
+            if not name:
+                continue
+            out.setdefault(name, {})
+            for m in (g.get("members") or []):
+                uid = str(m.get("uid") or "").strip()
+                if uid.isdigit():
+                    out[name][uid] = {"name": _guild_name(m.get("name")) or ("UID " + uid),
+                                      "uid": uid}
+    except Exception:
+        pass
+    try:
+        with open(GUILD_USER, encoding="utf-8") as f:
+            user = json.load(f)
+        for name, arr in (user.items() if isinstance(user, dict) else []):
+            name = str(name).strip()
+            if not name or not isinstance(arr, list):
+                continue
+            out.setdefault(name, {})
+            for m in arr:
+                uid = str((m or {}).get("uid") or "").strip()
+                if uid.isdigit():
+                    out[name][uid] = {"name": str((m or {}).get("name") or uid)[:40],
+                                      "uid": uid}
+    except Exception:
+        pass
+    return {k: list(v.values()) for k, v in out.items()}
+
+
+def api_guilds():
+    g = _guilds_load()
+    meta = _guild_seed_meta()
+    return 200, {"guilds": [{"name": k, "count": len(v),
+                             "official": bool((meta.get(k) or {}).get("official_uid")),
+                             "source": (meta.get(k) or {}).get("source") or ""}
+                            for k, v in sorted(g.items(), key=lambda kv: -len(kv[1]))]}
+
+
+def api_guild_live(name):
+    name = str(name or "").strip()
+    if not name:
+        return 400, {"error": "缺少工会名"}
+    now = time.time()
+    hit = _GUILD_CACHE.get(name)
+    if hit and now - hit["at"] < GUILD_CACHE_TTL:
+        return 200, hit["data"]
+    members = _guilds_load().get(name) or []
+    if not members:
+        return 404, {"error": "没有这个工会的名册"}
+    uids = [m["uid"] for m in members]
+    live = []
+    failed = 0
+    for i in range(0, len(uids), FOLLOW_BATCH):
+        got = _follow_batch(uids[i:i + FOLLOW_BATCH])
+        if got is None:
+            failed += 1
+            continue
+        live.extend(got)
+    if failed and not live:
+        return 502, {"error": "开播状态获取失败（可能被限流），稍后重试"}
+    # 名册里的显示名优先（B 站 uname 可能带后缀）
+    by_uid = {m["uid"]: m for m in members}
+    for x in live:
+        m = by_uid.get(x["mid"])
+        if m and m.get("name"):
+            x["name"] = m["name"]
+    live.sort(key=lambda x: -(x.get("online") or 0))
+    _vtbs_attach(live)               # 粉丝数 / 签名（vtbs.moe，取不到就跳过）
+    data = {"ok": True, "name": name, "total": len(members), "live": len(live),
+            "list": live, "at": int(now), "vtbs": _vtbs_status(),
+            "warn": ("有 %d 批状态获取失败，结果可能不全" % failed) if failed else ""}
+    _GUILD_CACHE[name] = {"at": now, "data": data}
+    return 200, data
+
+
+# 官方账号的关注列表里混着合作方 / 活动号 / 自己的频道号。vtbs.moe 只解决「是不是主播」，
+# 这里再按名字挡一层（实测 VR 官方 100 个关注里 22 个是这类账号）。
+GUILD_NOISE = re.compile(
+    r"(官方|频道|小助手|推广|发电|音乐机|园长|大会员|装扮|周边|赛事|工作室|"
+    r"火锅|肯德基|手游|数字直播|中心|Project|搬运|上校)", re.I)
+GUILD_NOISE_SUFFIX = re.compile(r"_?[Oo]fficial$")
+
+
+def _guild_seed_meta():
+    """seed 里每个工会的官方账号 UID / 来源说明（名册刷新要用）。"""
+    out = {}
+    try:
+        with open(GUILD_SEED, encoding="utf-8") as f:
+            seed = json.load(f)
+        for g in (seed.get("guilds") or []):
+            n = str(g.get("name") or "").strip()
+            if n:
+                out[n] = {"official_uid": str(g.get("official_uid") or ""),
+                          "source": str(g.get("source") or "")}
+    except Exception:
+        pass
+    return out
+
+
+def _vtbs_uids():
+    """vtbs.moe 收录的主播 UID 集合（名册过滤用）。
+
+    复用上面 vtbs 资料表的那份缓存（原先这里另抓一次整包、另写一个
+    `vtbs_cache.json`，等于同一个接口打两遍、每次多等 20 秒）。
+    """
+    return set(vtbs_map(block=True).keys())
+
+
+def _guild_followings(vmid, pages=4):
+    """读某个 B 站账号的「关注」列表（要登录态；官方账号是公开的）。
+
+    每页 50 条，最多 4 页 —— 再多请求容易招风控，而工会关注列表一般 <200 人。
+    """
+    out, seen = [], set()
+    for pn in range(1, pages + 1):
+        url = wbi_signed("https://api.bilibili.com/x/relation/followings",
+                         {"vmid": str(vmid), "pn": pn, "ps": 50, "order": "desc"})
+        d = bili_get(url, referer="https://space.bilibili.com/%s/relation/follow" % vmid)
+        if not isinstance(d, dict):
+            break
+        if d.get("code") != 0:
+            if pn == 1:
+                raise RuntimeError(d.get("message") or ("code %s" % d.get("code")))
+            break
+        lst = (d.get("data") or {}).get("list") or []
+        for m in lst:
+            uid = str(m.get("mid") or "")
+            if uid.isdigit() and uid not in seen:
+                seen.add(uid)
+                out.append({"name": str(m.get("uname") or "").strip() or ("UID " + uid),
+                            "uid": uid})
+        if len(lst) < 50:
+            break
+        time.sleep(0.4)
+    return out
+
+
+def api_guild_refresh(name):
+    """POST /api/live/guild/refresh —— 从工会的**官方 B 站账号关注列表**补人名。
+
+    名册 = 内置 seed（随版本更新）+ 这里补进来的（写 data/guilds_user.json，不进包）。
+    只做「补」不做「删」：官方账号偶尔会取关老成员，那些人也还在名册里。
+    """
+    name = str(name or "").strip()
+    if not name:
+        return 400, {"error": "缺少工会名"}
+    meta = _guild_seed_meta().get(name) or {}
+    official = str(meta.get("official_uid") or "").strip()
+    if not official.isdigit():
+        return 400, {"error": "「%s」还没有登记官方账号 UID，暂时不能自动补全" % name}
+    if not sessdata():
+        return 401, {"error": "读官方账号的关注列表需要登录：设置页扫码后再试"}
+    try:
+        rows = _guild_followings(official)
+    except Exception as e:
+        return 502, {"error": "读关注列表失败：%s" % str(e)[:80]}
+    if not rows:
+        return 502, {"error": "官方账号的关注列表是空的（或对方设了隐私）"}
+    vt = _vtbs_uids()
+    if not vt:
+        # 主播库没取到就**不要写**：这时没有任何过滤依据，会把合作方、活动号
+        # 一起写进名册（用户看到的就是「名册里混进一堆不是主播的号」）。
+        return 502, {"error": "主播库（vtbs.moe）暂时取不到，无法判断哪些是主播；稍后再试一次"}
+    keep = []
+    for m in rows:
+        nm = m["name"]
+        if GUILD_NOISE.search(nm) or GUILD_NOISE_SUFFIX.search(nm):
+            continue
+        if m["uid"] not in vt:
+            continue
+        keep.append(m)
+    # 写进用户名册（与手动添加共用同一个文件）
+    try:
+        with open(GUILD_USER, encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            data = {}
+    except Exception:
+        data = {}
+    arr = data.get(name) if isinstance(data.get(name), list) else []
+    have = {str((x or {}).get("uid")) for x in arr}
+    # 「新增」按**合并后的名册**算：seed 里已经有的人不算新增，
+    # 否则第一次点同步会把 76 个老成员全报成「新增」，而总数一点没变（用户会以为坏了）。
+    existing = {str((m or {}).get("uid")) for m in (_guilds_load().get(name) or [])}
+    added = 0
+    for m in keep:
+        if m["uid"] in have:
+            continue
+        arr.append({"name": _guild_name(m["name"])[:40], "uid": m["uid"]})
+        have.add(m["uid"])
+        if m["uid"] not in existing:
+            added += 1
+    data[name] = arr
+    try:
+        os.makedirs(os.path.dirname(GUILD_USER), exist_ok=True)
+        with open(GUILD_USER, "w", encoding="utf-8", newline="\n") as f:
+            json.dump(data, f, ensure_ascii=False, indent=1)
+    except OSError as e:
+        return 500, {"error": "保存失败：%s" % str(e)[:80]}
+    _GUILD_CACHE.pop(name, None)
+    print("[guild] %s 从官方账号补了 %d 人（关注 %d / 主播 %d）"
+          % (name, added, len(rows), len(keep)))
+    return 200, {"ok": True, "guild": name, "official_uid": official,
+                 "fetched": len(rows), "kept": len(keep), "added": added,
+                 "total": len(_guilds_load().get(name) or [])}
+
+
+def api_guild_add(obj):
+    name = str(obj.get("guild") or "").strip()
+    uid = str(obj.get("uid") or "").strip()
+    uname = str(obj.get("name") or "").strip()
+    if not name or len(name) > 40:
+        return 400, {"error": "工会名不能为空，且不超过 40 字"}
+    if not uid.isdigit():
+        return 400, {"error": "B 站 UID 必须是数字"}
+    if not uname:
+        uname = "UID " + uid
+    try:
+        with open(GUILD_USER, encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            data = {}
+    except Exception:
+        data = {}
+    arr = data.get(name) if isinstance(data.get(name), list) else []
+    if not any(str((x or {}).get("uid")) == uid for x in arr):
+        arr.append({"name": uname[:40], "uid": uid})
+    data[name] = arr
+    try:
+        os.makedirs(os.path.dirname(GUILD_USER), exist_ok=True)
+        with open(GUILD_USER, "w", encoding="utf-8", newline="\n") as f:
+            json.dump(data, f, ensure_ascii=False, indent=1)
+    except OSError as e:
+        return 500, {"error": "保存失败：%s" % str(e)[:80]}
+    _GUILD_CACHE.pop(name, None)
+    return 200, {"ok": True, "guild": name, "uid": uid, "name": uname}
+
+
+# ---------------------------------------------------------------- vtbs.moe 主播资料
+# 用途：名字 / 头像 / 房间号 / 粉丝数 / 签名 / 舰队数（**静态资料**）。
+# ⚠️ vtbs.moe 的 liveStatus / online 实测没有在维护（快照 9,898 人只有 1 人标记在播），
+#    所以「在播 / 在线人数」一律仍走 B 站接口，这里只补资料。UI 上要标来源与更新时间。
+VTBS_INFO = "https://api.vtbs.moe/v1/info"
+VTBS_INFO_FILE = os.path.join(ROOT, "data", "vtbs_info.json")
+VTBS_INFO_TTL = 12 * 3600
+_VTBS_INFO = {"at": 0.0, "map": {}, "error": "", "busy": False, "loaded": False}
+
+
+def _vtbs_trim(x):
+    """只留展示要用的字段：全量 6.3MB，裁剪后约 2MB，落盘/传输都轻一些。"""
+    mid = str(x.get("mid") or "")
+    if not mid.isdigit():
+        return None
+    last = x.get("lastLive") or {}
+    return {
+        "mid": mid,
+        "uname": str(x.get("uname") or ""),
+        "room": str(x.get("roomid") or ""),
+        "face": str(x.get("face") or ""),
+        "follower": int(x.get("follower") or 0),
+        "sign": str(x.get("sign") or "")[:120],
+        "guard": int(x.get("guardNum") or 0),
+        "last": str(last.get("title") or "")[:80] if isinstance(last, dict) else "",
+    }
+
+
+def _vtbs_read_disk():
+    try:
+        with open(VTBS_INFO_FILE, encoding="utf-8") as f:
+            d = json.load(f)
+        arr = d.get("list") or []
+        m = {x["mid"]: x for x in arr if isinstance(x, dict) and x.get("mid")}
+        if m:
+            _VTBS_INFO.update(at=float(d.get("at") or 0), map=m, loaded=True)
+    except Exception:
+        pass
+
+
+def _vtbs_fetch(write_disk=True):
+    """整包抓一次（gzip，实测 11~19 秒 / 9,898 条），抓不到就把错误留在状态里。"""
+    if _VTBS_INFO["busy"]:
+        return
+    _VTBS_INFO["busy"] = True
+    try:
+        req = urllib.request.Request(VTBS_INFO, headers={
+            "User-Agent": UA, "Accept-Encoding": "gzip"})
+        with urllib.request.urlopen(req, timeout=60) as r:
+            raw = r.read()
+            if (r.headers.get("Content-Encoding") or "").lower() == "gzip":
+                raw = gzip.decompress(raw)
+        arr = json.loads(raw.decode("utf-8", "replace"))
+        m = {}
+        for x in arr:
+            t = _vtbs_trim(x)
+            if t:
+                m[t["mid"]] = t
+        if not m:
+            raise RuntimeError("返回 0 条")
+        now = time.time()
+        _VTBS_INFO.update(at=now, map=m, error="", loaded=True)
+        if write_disk:
+            try:
+                os.makedirs(os.path.dirname(VTBS_INFO_FILE), exist_ok=True)
+                with open(VTBS_INFO_FILE, "w", encoding="utf-8", newline="\n") as f:
+                    json.dump({"at": now, "list": list(m.values())}, f, ensure_ascii=False)
+            except OSError as e:
+                print("[vtbs] 落盘失败：%s" % e)
+        print("[vtbs] 资料已更新：%d 人" % len(m))
+    except Exception as e:
+        _VTBS_INFO["error"] = "%s: %s" % (type(e).__name__, str(e)[:80])
+        print("[vtbs] 资料获取失败：%s" % _VTBS_INFO["error"])
+    finally:
+        _VTBS_INFO["busy"] = False
+
+
+def vtbs_map(block=False):
+    """拿「mid → 资料」表。
+
+    ⚠️ 默认**不阻塞**：整包要 11~19 秒，绝不能卡在「推荐列表」这种页面上。
+    没有缓存时先返回空表并起后台线程；只有明确要一个人的资料（详情/名册同步）
+    才用 block=True 同步等。
+    """
+    if not _VTBS_INFO["loaded"]:
+        _vtbs_read_disk()
+    now = time.time()
+    fresh = _VTBS_INFO["map"] and now - _VTBS_INFO["at"] < VTBS_INFO_TTL
+    if not fresh and not _VTBS_INFO["busy"]:
+        if block:
+            _vtbs_fetch()
+        else:
+            threading.Thread(target=_vtbs_fetch, daemon=True).start()
+    return _VTBS_INFO["map"]
+
+
+def _vtbs_status():
+    m = _VTBS_INFO["map"]
+    return {"ok": True, "ready": bool(m), "count": len(m),
+            "at": int(_VTBS_INFO["at"] or 0),
+            "age": int(time.time() - _VTBS_INFO["at"]) if _VTBS_INFO["at"] else -1,
+            "stale": bool(m) and time.time() - _VTBS_INFO["at"] > VTBS_INFO_TTL,
+            "refreshing": bool(_VTBS_INFO["busy"]), "error": _VTBS_INFO["error"]}
+
+
+def api_vtbs_status():
+    vtbs_map()                       # 首次进监控室时顺手在后台起一次
+    return 200, _vtbs_status()
+
+
+def api_vtbs_refresh():
+    if not _VTBS_INFO["busy"]:
+        threading.Thread(target=_vtbs_fetch, daemon=True).start()
+    return 200, _vtbs_status()
+
+
+def api_vtbs_profile(mid):
+    mid = str(mid or "").strip()
+    if not mid.isdigit():
+        return 400, {"error": "mid 必须是数字"}
+    p = vtbs_map(block=True).get(mid)
+    if not p:
+        return 404, {"error": "vtbs.moe 里没有这个 UID（只收录虚拟主播）",
+                     "status": _vtbs_status()}
+    return 200, {"ok": True, "profile": p, "status": _vtbs_status()}
+
+
+def _vtbs_attach(items):
+    """给一批主播卡片补 vtbs 资料（粉丝数 / 签名 / 舰队）。取不到就原样返回。"""
+    m = vtbs_map()
+    if not m:
+        return items
+    for x in items:
+        p = m.get(str(x.get("mid") or ""))
+        if not p:
+            continue
+        x["follower"] = p.get("follower") or 0
+        x["vtbs"] = True
+        # B 站批量查开播状态时，偶尔会给「在播但 uname/face 为空」的条目
+        # （房间刚开播 / 风控降级）。vtbs 的资料表正好补这两个字段，
+        # 否则列表里会出现没有名字、头像是个「?」的行。
+        if not x.get("uname") and p.get("uname"):
+            x["uname"] = p["uname"]
+        if not x.get("face") and p.get("face"):
+            x["face"] = p["face"]
+        if p.get("sign"):
+            x["sign"] = p["sign"]
+        if p.get("guard"):
+            x["guard"] = p["guard"]
+    return items
+
+
+def api_live_recommend(area="9"):
+    """虚拟区当前热门（Area/getRoomList，老接口不需要 wbi 签名）。"""
+    area = str(area or "9")
+    if not area.isdigit():
+        area = "9"
+    now = time.time()
+    if RECOMMEND_CACHE["data"] and RECOMMEND_CACHE["area"] == area \
+            and now - RECOMMEND_CACHE["at"] < 60:
+        return 200, {"ok": True, "area": area, "list": RECOMMEND_CACHE["data"],
+                     "cached": True, "vtbs": _vtbs_status()}
+    url = ("https://api.live.bilibili.com/room/v1/Area/getRoomList"
+           "?parent_area_id=%s&area_id=0&sort_type=online&page_no=1&page_size=30" % area)
+    try:
+        d = bili_get(url, "https://live.bilibili.com/%s" % area, fallback_anon=True)
+    except Exception as e:
+        return 502, {"error": "推荐列表获取失败：%s" % str(e)[:80]}
+    if d.get("code") != 0:
+        return 502, {"error": "推荐列表 code=%s %s" % (d.get("code"), d.get("message"))}
+    out = []
+    for x in (d.get("data") or []):
+        room = str(x.get("roomid") or "")
+        mid = str(x.get("uid") or "")
+        if not room or not mid:
+            continue
+        out.append({"mid": mid, "room": room, "uname": x.get("uname") or "",
+                    "face": x.get("face") or "", "title": x.get("title") or "",
+                    "online": int(x.get("online") or 0),
+                    "area": x.get("area_v2_name") or x.get("area_name") or "",
+                    "cover": x.get("user_cover") or x.get("cover") or ""})
+    RECOMMEND_CACHE.update(at=now, area=area, data=out)
+    # 资料（粉丝数 / 签名）来自 vtbs.moe；在播与在线是 B 站给的，两者拼在一起
+    return 200, {"ok": True, "area": area, "list": _vtbs_attach(out), "cached": False,
+                 "vtbs": _vtbs_status()}
+
+
+# ---------------------------------------------------------------- Danmist 弹幕板
+# 独立应用（MIT），默认 127.0.0.1:8373。这里只做「探测 + 尝试启动」，不捆绑、不改它。
+DANMIST_URL = "http://127.0.0.1:8373/"
+DANMIST_DOWNLOAD = "https://github.com/xShadowMoon/Danmist/releases/latest"
+
+
+def _danmist_running():
+    try:
+        req = urllib.request.Request(DANMIST_URL, headers={"User-Agent": UA})
+        with urllib.request.urlopen(req, timeout=0.8) as r:
+            return 200 <= int(getattr(r, "status", 200)) < 500
+    except Exception:
+        return False
+
+
+def _danmist_exe():
+    lad = os.environ.get("LOCALAPPDATA") or ""
+    pf = os.environ.get("ProgramFiles") or r"C://Program Files"
+    cands = [
+        os.path.join(lad, "Programs", "Danmist", "Danmist.exe"),
+        os.path.join(lad, "Programs", "Danmist", "danmist.exe"),
+        os.path.join(lad, "Danmist", "Danmist.exe"),
+        os.path.join(pf, "Danmist", "Danmist.exe"),
+    ]
+    for p in cands:
+        if lad and p and os.path.isfile(p):
+            return p
+    return ""
+
+
+def api_danmist_status():
+    run = _danmist_running()
+    return 200, {"ok": True, "running": run, "url": DANMIST_URL,
+                 "download": DANMIST_DOWNLOAD, "exe": _danmist_exe()}
+
+
+def api_danmist_start():
+    if _danmist_running():
+        return 200, {"ok": True, "running": True, "url": DANMIST_URL}
+    exe = _danmist_exe()
+    if not exe:
+        return 404, {"error": "没有找到 Danmist。装上（或解压）后再点一次。",
+                     "download": DANMIST_DOWNLOAD, "running": False}
+    try:
+        subprocess.Popen([exe], cwd=os.path.dirname(exe),
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                         stdin=subprocess.DEVNULL, close_fds=True,
+                         creationflags=0x00000008 | 0x00000200)
+    except Exception as e:
+        return 500, {"error": "启动失败：%s" % str(e)[:100], "download": DANMIST_DOWNLOAD}
+    for _ in range(24):
+        time.sleep(0.5)
+        if _danmist_running():
+            return 200, {"ok": True, "running": True, "url": DANMIST_URL}
+    return 504, {"error": "已尝试启动，但 12 秒内没等到 8373 端口响应。",
+                 "download": DANMIST_DOWNLOAD, "running": False}
+
+
+def _follow_live_fetch(force_uids=False):
+    """同步跑完整条链：名单 → 并发查开播 → 按人气排序。
+
+    ⚠️ 只要**有一批**取失败就必须整体抛错：那一批里的在播主播会整批消失，
+       对比旧数据看起来就像「大家都下播了」，会被当成正常结果写进缓存。
+       以前只在「所有批都失败」时才抛，单批失败会被静默吞掉。
+    """
     uids = _following_uids()
     batches = [uids[i:i + FOLLOW_BATCH] for i in range(0, len(uids), FOLLOW_BATCH)]
     live = []
@@ -4874,11 +6404,18 @@ def _follow_live_fetch():
         with concurrent.futures.ThreadPoolExecutor(
                 max_workers=min(FOLLOW_WORKERS, len(batches))) as ex:
             got = list(ex.map(_follow_batch, batches))
-        if all(g is None for g in got):
-            raise RuntimeError("开播状态全部取失败（可能被限流）")
+        # 失败批次单独重试一次（间隔 0.4 秒，避开瞬时 412 / 连接被关）
+        for i, g in enumerate(got):
+            if g is None:
+                time.sleep(0.4)
+                got[i] = _follow_batch(batches[i])
+        missing = [i + 1 for i, g in enumerate(got) if g is None]
+        if missing:
+            raise RuntimeError("开播状态有 %d/%d 批取失败（第 %s 批，可能被限流）"
+                               % (len(missing), len(batches),
+                                  "、".join(str(x) for x in missing[:5])))
         for g in got:
-            if g:
-                live.extend(g)
+            live.extend(g)
     live.sort(key=lambda x: -(x.get("online") or 0))    # 人多的排前面，监控场景直觉
     return live
 
@@ -4887,7 +6424,8 @@ def _follow_disk_load():
     """把上次落盘的名单 / 在播列表装回内存（进程重启后第一次进监控室不必干等）。
 
     任何异常都当作「没有缓存」—— 缓存不该把功能带崩。只装「还新鲜」的东西：
-    在播列表给 24 小时（当 stale 用，后台会立刻刷新），名单给 `FOLLOW_UIDS_TTL`。
+    在播列表只认 `FOLLOW_DISK_TTL`（1 小时，当 stale 用、后台立刻刷新），
+    名单给 `FOLLOW_UIDS_TTL`。
     """
     try:
         with open(FOLLOW_DISK, encoding="utf-8") as f:
@@ -4924,11 +6462,25 @@ def _follow_disk_save():
 
 
 def _follow_store(live):
-    """写缓存，并挡住「新结果比旧结果少一半以上」这种残缺覆盖。"""
-    old = FOLLOW_CACHE["list"]
-    if old and len(old) >= 4 and len(live) < len(old) / 2:
-        raise RuntimeError("新结果只有 %d 位在播（旧数据 %d 位），疑似上游残缺，保留旧数据"
-                           % (len(live), len(old)))
+    """写缓存。
+
+    ⚠️ **不要**再按「新结果比旧结果少一半」判残缺。在播人数从晚高峰到白天掉一半
+       是正常现象；这条启发式一旦误判，新的正确名单会被永远挡在门外，页面就一直
+       显示几小时前的那份（实测：88 → 36 被拒，20 小时后仍是 88，格子里 71 个
+       写着「未开播」）。完整性现在由 `_follow_live_fetch` 的「任一批失败即抛错」
+       保证，这里只负责落盘。
+    """
+    # 上游偶尔会给「在播、但 uname/face 为空」的条目：不能拿它覆盖上一份好数据，
+    # 否则刷新一次列表就变成一排没名字的行（实测 72 条里有 17 条）。
+    prev = {str(x.get("mid")): x for x in (FOLLOW_CACHE.get("list") or [])}
+    for x in live:
+        o = prev.get(str(x.get("mid")))
+        if not o:
+            continue
+        if not x.get("uname"):
+            x["uname"] = o.get("uname") or ""
+        if not x.get("face"):
+            x["face"] = o.get("face") or ""
     with FOLLOW_LOCK:
         FOLLOW_CACHE["at"] = time.time()
         FOLLOW_CACHE["list"] = live
@@ -4945,7 +6497,10 @@ def _kick_follow_refresh():
     def work():
         try:
             t0 = time.time()
-            _follow_store(_follow_live_fetch())
+            # uid 名单缓存 30 分钟；后台刷新时若名单已超过 5 分钟，顺带重读一次关注关系 ——
+            # 否则用户刚取消关注，后台每 2 分钟刷新的仍是旧名单，那个人会一直在列表里。
+            stale_uids = time.time() - float(FOLLOW_CACHE.get("uids_at") or 0) > 300
+            _follow_store(_follow_live_fetch(force_uids=stale_uids))
             print("[follow] 后台刷新完成：%d 位在播，%d ms"
                   % (len(FOLLOW_CACHE["list"]), int((time.time() - t0) * 1000)))
         except Exception as e:
@@ -4978,6 +6533,8 @@ def api_following_live(force=False):
         if not FOLLOW_CACHE["list"]:
             _follow_disk_load()
     old = FOLLOW_CACHE["list"]
+    if old:
+        _vtbs_attach(old)          # 粉丝数 / 签名（vtbs 资料层；取不到就原样返回）
     if old and not force:
         if now - FOLLOW_CACHE["at"] < FOLLOW_LIVE_TTL:
             return 200, {"list": old, "cached": True}
@@ -4986,10 +6543,22 @@ def api_following_live(force=False):
                      "age": int(now - FOLLOW_CACHE["at"]), "refreshing": busy}
     if old and force and FOLLOW_CACHE["busy"]:
         # 已经在后台刷了：再同步跑一轮只会白打一遍接口（还可能招风控）
-        return 200, {"list": old, "cached": True, "stale": True, "refreshing": True}
+        return 200, {"list": old, "cached": True, "stale": True, "refreshing": True,
+                     "age": int(now - FOLLOW_CACHE["at"])}
     t0 = time.time()
-    live = _follow_live_fetch()
+    try:
+        # 手动刷新（force）= 重新读关注关系，不再用半小时前的 uid 名单
+        live = _follow_live_fetch(force_uids=bool(force))
+    except Exception as e:
+        # 同步取失败：有旧数据就把它连同原因一起给前端（列表不清空、只标「刷新失败」），
+        # 没有旧数据才真的报错。以前这里直接抛 500，页面只剩一句「读取失败」。
+        if old:
+            return 200, {"list": old, "cached": True, "stale": True, "refreshing": False,
+                         "age": int(now - FOLLOW_CACHE["at"]),
+                         "error": "刷新失败：%s" % str(e)[:80]}
+        return 502, {"error": "读取关注列表失败：%s" % str(e)[:100]}
     _follow_store(live)
+    _vtbs_attach(live)          # 刚取回的这一批也要补粉丝数（命中缓存的分支已经在上面补过）
     ms = int((time.time() - t0) * 1000)
     print("[follow] 取到 %d 位在播，耗时 %d ms" % (len(live), ms))
     return 200, {"list": live, "ms": ms}
@@ -6033,9 +7602,12 @@ def api_dd_profile(query):
         if not name:
             continue
         rec = livers.setdefault(lid or name, {"name": name, "id": lid, "n": 0,
-                                              "money": 0.0, "medal": 0,
+                                              "msg_n": 0, "money": 0.0, "medal": 0,
                                               "medal_name": "", "room": ""})
         rec["n"] += 1
+        # 弹幕榜只数纯弹幕（action_name=msg）—— 与消费榜口径互斥，不再混排
+        if an == "msg":
+            rec["msg_n"] += 1
         rec["money"] += money
         rec["medal"] = max(rec["medal"], int(x.get("medal_level") or 0))
         if not rec["medal_name"]:
@@ -6043,10 +7615,22 @@ def api_dd_profile(query):
         if not rec["room"]:
             rec["room"] = str(x.get("live_room") or "")
 
-    board = sorted(livers.values(), key=lambda r: (-r["money"], -r["n"]))[:30]
-    total = sum(r["n"] for r in board) or 1
+    # 两个榜各自取前 30 再合并去重：只打赏不弹幕、只弹幕不打赏的人都要能在自己的榜里出现。
+    by_money = sorted(livers.values(), key=lambda r: (-r["money"], -r["msg_n"]))[:30]
+    by_msg = sorted(livers.values(), key=lambda r: (-r["msg_n"], -r["money"]))[:30]
+    board, seen = [], set()
+    for r in by_money + by_msg:
+        k = r["id"] or r["name"]
+        if k in seen:
+            continue
+        seen.add(k)
+        board.append(r)
+    money_total = sum(r["money"] for r in board) or 1.0
+    msg_total = sum(r["msg_n"] for r in board) or 1
     for r in board:
-        r["pct"] = round(r["n"] * 100.0 / total, 1)
+        r["pct"] = round(r["money"] * 100.0 / money_total, 1)   # 兼容旧字段
+        r["pct_money"] = r["pct"]
+        r["pct_msg"] = round(r["msg_n"] * 100.0 / msg_total, 1)
         r["money"] = round(r["money"], 1)
     # 「最近出没」：样本里最新那条的时间（created_at 带时区，字符串比较即可）
     last_at = ""
@@ -6086,7 +7670,7 @@ def api_dd_profile(query):
                            "spend": round(spend, 1),       # 已抓样本里的打赏额
                            "guards": kinds["guard"],       # 上舰次数
                            "medals": medals,               # 粉丝牌种类
-                           "livers": len(board)},          # 常去的主播数
+                           "livers": len(livers)},         # 常去的主播数（未截断）
                  "kinds": kinds,
                  "mix": mix,                 # 互斥的互动构成（环形图用）
                  "hours": hours,             # 24 小时出没分布（柱状图用）
@@ -6628,6 +8212,120 @@ def _close_live_stream(stream, proc):
             pass
 
 
+class _FlvTimeline:
+    """把 FLV 媒体时间戳改成「从 0 开始、跨断点连续」。
+
+    背景（2026-11-24 实测 + issue 报告）：部分房间的媒体 tag 直接带绝对 PTS
+    （HLS→ffmpeg 兜底时 video 首帧 6,308,366 ms；直连 FLV 也抓到尾随 7,125,199 ms 的跳变）。
+    mpegts.js 以第一个时间戳为基准，遇到这种前跳会判成时间轴断裂：轻则数据被塞进
+    播不到的区间（currentTime 不再前进，看门狗报「画面已停止」），重则直接抛错
+    （「连接中断」）。监控室多路同时中招，就是「全都用不了」。
+
+    这里只改 tag 头的 4 字节时间戳，负载原样转发；音视频各自的基准只在
+    「首个媒体帧」和「断点」时调整，正常流的 A/V 相对关系不变。
+    """
+    MAX_STEP = 5000      # 同一轨相邻 tag 正常不会超过 5 秒
+    FIX_STEP = 40        # 断点后补的一小步，让时间轴继续前进
+
+    def __init__(self, label=""):
+        self.label = label
+        self.buf = b""
+        self.header_done = False
+        self.passthrough = False
+        self.base = None
+        self.offset = {}       # tag 类型 -> (raw - out)
+        self.last_raw = {}
+        self.last_out = {}
+        self.warned = False
+
+    def _fix(self, typ, tag):
+        ts = int.from_bytes(tag[4:7], "big") | (tag[7] << 24)
+        size = len(tag) - 15
+        # 配置帧没有实际播放时间：AVC sequence header / AAC sequence header
+        config = False
+        if typ == 9 and size >= 1 and tag[11] == 0:
+            config = True
+        elif typ == 8 and size >= 2 and (tag[11] >> 4) == 10 and tag[12] == 0:
+            config = True
+        if config:
+            out = self.last_out.get(typ, 0)
+        elif self.base is None:
+            self.base = ts
+            self.offset[typ] = ts
+            out = 0
+        elif typ not in self.offset:
+            # 另一条轨的第一个媒体帧：和基准差得远就按「两轨基准不一致」处理
+            if abs(ts - self.base) > self.MAX_STEP:
+                self.offset[typ] = ts
+                out = 0
+                self._warn(typ, ts, out, "音视频基准不一致")
+            else:
+                self.offset[typ] = self.base
+                out = ts - self.base
+        else:
+            delta = ts - self.last_raw.get(typ, ts)
+            if abs(delta) > self.MAX_STEP:
+                out = self.last_out.get(typ, 0) + self.FIX_STEP
+                self.offset[typ] = ts - out
+                self._warn(typ, ts, out, "时间戳跳变 %d ms" % delta)
+            else:
+                out = ts - self.offset[typ]
+                if out < 0:
+                    out = self.last_out.get(typ, 0) + 1
+        self.last_raw[typ] = ts
+        self.last_out[typ] = out
+        out &= 0xFFFFFFFF
+        tag[4:7] = (out & 0xFFFFFF).to_bytes(3, "big")
+        tag[7] = (out >> 24) & 0xFF
+
+    def _warn(self, typ, ts, out, why):
+        if self.warned:
+            return
+        self.warned = True
+        print("[play] %s 时间戳已归一化：type=%d raw=%d → %d（%s）"
+              % (self.label or "直播流", typ, ts, out, why))
+
+    def feed(self, chunk):
+        if self.passthrough:
+            return chunk
+        self.buf += chunk
+        out = []
+        while True:
+            if not self.header_done:
+                if len(self.buf) < 9:
+                    break
+                if self.buf[:3] != b"FLV":
+                    self.passthrough = True      # 不是 FLV：原样放过，别把流弄坏
+                    out.append(self.buf)
+                    self.buf = b""
+                    break
+                need = int.from_bytes(self.buf[5:9], "big") + 4
+                if len(self.buf) < need:
+                    break
+                out.append(self.buf[:need])
+                self.buf = self.buf[need:]
+                self.header_done = True
+                continue
+            if len(self.buf) < 11:
+                break
+            size = int.from_bytes(self.buf[1:4], "big")
+            total = 11 + size + 4
+            if total > 8 * 1024 * 1024:          # 明显不是正常 tag：放弃改写
+                self.passthrough = True
+                out.append(self.buf)
+                self.buf = b""
+                break
+            if len(self.buf) < total:
+                break
+            tag = bytearray(self.buf[:total])
+            typ = tag[0]
+            if typ in (8, 9):
+                self._fix(typ, tag)
+            out.append(bytes(tag))
+            self.buf = self.buf[total:]
+        return b"".join(out)
+
+
 def api_live_stream(handler, query):
     """转发直播流。直播是持续流，不支持 Range；断开由客户端决定（关页面 / 切走）。
 
@@ -6642,12 +8340,15 @@ def api_live_stream(handler, query):
     handler.send_response(200)
     handler.send_header("Content-Type", "video/x-flv")
     handler.end_headers()
+    tl = _FlvTimeline("room %s/http" % room)
     try:
         while True:
             chunk = stream.read1(WS_CHUNK)
             if not chunk:
                 break
-            handler.wfile.write(chunk)
+            data = tl.feed(chunk)
+            if data:
+                handler.wfile.write(data)
     except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
         pass                       # 观众关页面 / 切走，属正常断开
     finally:
@@ -6697,6 +8398,12 @@ def ws_accept(handler):
         return False
     accept = base64.b64encode(
         hashlib.sha1((key + WS_GUID).encode("ascii")).digest()).decode("ascii")
+    # ⚠️ 握手必须回 HTTP/1.1：Handler 继承 BaseHTTPRequestHandler 的默认值 HTTP/1.0，
+    #    状态行就成了 "HTTP/1.0 101 Switching Protocols"。Chrome 容忍这种 1.0 的升级，
+    #    **Firefox 直接判握手失败**（控制台 "can't establish a connection to the server"），
+    #    表现就是监控室每一格都黑着、但同一个接口用 curl/Chrome 都正常。
+    #    只在这一条连接上改，不影响普通请求（它们仍走 1.0 + 关闭连接）。
+    handler.protocol_version = "HTTP/1.1"
     handler.send_response(101, "Switching Protocols")
     handler.send_header("Upgrade", "websocket")
     handler.send_header("Connection", "Upgrade")
@@ -6774,6 +8481,7 @@ def api_live_ws(handler, query):
             pass
         print("[play] ws 房间 %s 取流失败：%s" % (room, err))
         return
+    tl = _FlvTimeline("room %s/ws" % room)
     try:
         while True:
             if ws_client_closed(handler):
@@ -6791,7 +8499,9 @@ def api_live_ws(handler, query):
             chunk = stream.read1(WS_CHUNK)
             if not chunk:
                 break
-            handler.wfile.write(ws_frame(chunk))
+            data = tl.feed(chunk)
+            if data:
+                handler.wfile.write(ws_frame(data))
     except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, OSError):
         pass                       # 观众关页面 / 取消勾选，属正常断开
     finally:
@@ -6901,7 +8611,20 @@ def chat_state(sid=None):
         if st is None:
             st = {"subs": [], "backlog": [], "worker": {
                 "thread": None, "running": False, "popularity": 0,
-                "error": "", "logged_err": ""}}
+                "error": "", "logged_err": ""},
+                # 监控室按房间轮询用：ring 带序号，便于 since 增量取
+                "ring": [], "seq": 0, "keep_at": 0.0, "ephemeral": False,
+                # 弹幕板五面板（SC / 礼物 / 观众 / 统计）：面板要「累计视图」，
+                # 不能只靠 200 条的环形缓冲（一场直播几百条礼物就被冲掉了）
+                "sc": [], "gifts": {}, "viewers": [], "enters": [], "guards": [],
+                # 去重表：礼物按消息号、进出按 uid+秒；SC 直接按 id 查列表
+                "gift_seen": {}, "enter_seen": {},
+                # meta_at / meta_busy：观众榜与「看过」走 HTTP 补（见 _board_meta_fetch）
+                "meta_at": 0.0, "meta_busy": False,
+                # hist_*：SC 快照与大航海名册（见 _board_hist_fetch）
+                "hist_at": 0.0, "hist_sc": 0, "live_start": 0, "hist_busy": False,
+                "stats": {"online": 0, "watched": 0, "likes": 0, "sc_total": 0,
+                          "gift_coin": 0, "danmaku": 0}}
             CHAT[sid] = st
         return st
 
@@ -6984,6 +8707,9 @@ def _chat_broadcast(sid, item):
     with CHAT_LOCK:
         st["backlog"].append(payload)
         del st["backlog"][:-CHAT_BACKLOG_MAX]
+        st["seq"] = int(st.get("seq") or 0) + 1
+        st.setdefault("ring", []).append({"seq": st["seq"], "item": item})
+        del st["ring"][:-200]
         subs = list(st["subs"])
     for q in subs:
         try:
@@ -6992,15 +8718,168 @@ def _chat_broadcast(sid, item):
             pass
 
 
-def _chat_parse(sid, data):
+# ---------------------------------------------------------------- protobuf（V2 命令）
+# B 站从 2025 起把「进场 / 送礼」改成了 *V2 命令：JSON 外壳只留 cmd 与 data.pb，
+# data.pb 是 base64 的 protobuf。原来只认 INTERACT_WORD / SEND_GIFT，于是
+# 「来过」永远是 0 次、礼物永远是空 —— 不是没数据，是这类包被整条丢掉了。
+# 字段号来自实测样本（SEND_GIFT_V2 的 10=礼物子消息；INTERACT_WORD_V2 的 5=行为）。
+
+
+def _pb_varint(b, i):
+    v = shift = 0
+    while i < len(b):
+        x = b[i]
+        i += 1
+        v |= (x & 0x7F) << shift
+        if not x & 0x80:
+            return v, i
+        shift += 7
+        if shift > 63:
+            break
+    raise ValueError("varint 越界")
+
+
+def _pb_fields(buf):
+    """极简 protobuf 解码 → {字段号: [值]}（varint 给 int，其余给 bytes）。"""
+    out = {}
+    i = 0
+    while i < len(buf):
+        key, i = _pb_varint(buf, i)
+        no, wt = key >> 3, key & 7
+        if no <= 0:
+            break
+        if wt == 0:
+            v, i = _pb_varint(buf, i)
+        elif wt == 2:
+            ln, i = _pb_varint(buf, i)
+            v = buf[i:i + ln]
+            i += ln
+        elif wt == 5:
+            v = buf[i:i + 4]
+            i += 4
+        elif wt == 1:
+            v = buf[i:i + 8]
+            i += 8
+        else:
+            break
+        out.setdefault(no, []).append(v)
+    return out
+
+
+def _pb_int(f, no, default=0):
+    v = f.get(no) or []
+    return int(v[0]) if v and isinstance(v[0], int) else default
+
+
+def _pb_str(f, no, default=""):
+    v = f.get(no) or []
+    if not v or not isinstance(v[0], (bytes, bytearray)):
+        return default
+    return bytes(v[0]).decode("utf-8", "replace")
+
+
+def _pb_sub(f, no):
+    v = f.get(no) or []
+    if v and isinstance(v[0], (bytes, bytearray)):
+        try:
+            return _pb_fields(v[0])
+        except Exception:
+            return {}
+    return {}
+
+
+def _gift_from_pb(raw):
+    """SEND_GIFT_V2：1 uid / 2 uname / 3 face / 10 礼物（2 名称、3 数量、7 总价、
+    8 币种、9 消息号、10 时间）。"""
+    f = _pb_fields(raw)
+    g = _pb_sub(f, 10)
+    face = _pb_str(f, 3)
+    if not face:                                  # 兜底：15.2.2 是 sender_uinfo.base.face
+        face = _pb_str(_pb_sub(_pb_sub(f, 15), 2), 2)
+    return {"uid": str(_pb_int(f, 1)), "uname": _pb_str(f, 2), "face": face,
+            "gift": _pb_str(g, 2), "num": _pb_int(g, 3, 1),
+            "coin": _pb_int(g, 7), "coin_type": _pb_str(g, 8),
+            "t": _pb_int(g, 10) or int(time.time()), "tid": _pb_str(g, 9),
+            "guard": _pb_int(f, 5)}
+
+
+def _interact_from_pb(raw):
+    """INTERACT_WORD_V2：1 uid / 2 uname / 5 行为（1 进入 / 2 关注）/ 7 秒级时间。"""
+    f = _pb_fields(raw)
+    mt = _pb_int(f, 5)
+    face = _pb_str(_pb_sub(_pb_sub(f, 22), 2), 2)
+    return {"uid": str(_pb_int(f, 1)), "uname": _pb_str(f, 2), "face": face,
+            "t": _pb_int(f, 7) or int(time.time()), "follow": mt == 2, "msg_type": mt}
+
+
+def _chat_add_sc(sid, item):
+    """SC 入库：按 id 去重（历史快照与实时事件会重叠），金额按列表重算。"""
+    st0 = chat_state(sid)
+    with CHAT_LOCK:
+        if item.get("id") and any(x.get("id") == item["id"] for x in st0["sc"]):
+            return False
+        st0["sc"].append(item)
+        st0["sc"].sort(key=lambda x: int(x.get("t") or 0))
+        del st0["sc"][:-200]
+        st0["stats"]["sc_total"] = sum(int(x.get("price") or 0) for x in st0["sc"])
+        return True
+
+
+def _chat_add_gift(sid, g):
+    """礼物入库：按消息号去重（同一条包可能被重连/补拉重复投递）。"""
+    if not g.get("gift"):
+        return False
+    st0 = chat_state(sid)
+    with CHAT_LOCK:
+        tid = str(g.get("tid") or "")
+        if tid:
+            if tid in st0["gift_seen"]:
+                return False
+            st0["gift_seen"][tid] = 1
+            if len(st0["gift_seen"]) > 800:
+                for k in list(st0["gift_seen"])[:200]:
+                    st0["gift_seen"].pop(k, None)
+        if g.get("coin_type") == "gold":
+            st0["stats"]["gift_coin"] += int(g.get("coin") or 0)
+        k = str(g.get("uid") or "") + "|" + str(g.get("gift") or "")
+        cur = st0["gifts"].get(k)
+        if cur:
+            cur["num"] += int(g.get("num") or 1)
+            cur["coin"] += int(g.get("coin") or 0)
+            cur["t"] = max(int(cur.get("t") or 0), int(g.get("t") or 0))
+        else:
+            st0["gifts"][k] = dict(g)
+            if len(st0["gifts"]) > 200:
+                oldest = min(st0["gifts"].items(), key=lambda kv: kv[1]["t"])
+                st0["gifts"].pop(oldest[0], None)
+        return True
+
+
+def _chat_add_enter(sid, e):
+    """进出记录：按 uid+时间 去重；只留最近 300 条。"""
+    st0 = chat_state(sid)
+    with CHAT_LOCK:
+        k = (str(e.get("uid") or ""), int(e.get("t") or 0))
+        if k in st0["enter_seen"]:
+            return False
+        st0["enter_seen"][k] = 1
+        if len(st0["enter_seen"]) > 600:
+            for k2 in list(st0["enter_seen"])[:200]:
+                st0["enter_seen"].pop(k2, None)
+        st0["enters"].append(e)
+        del st0["enters"][:-300]
+        return True
+
+
+def _chat_parse(sid, packet):
     """消费网关数据包，返回本帧是否含认证成功回执。"""
     off = 0
     authenticated = False
-    while off + 16 <= len(data):
-        length, header, version, op, _ = struct.unpack_from(">IHHII", data, off)
-        if header < 16 or length < header or off + length > len(data):
+    while off + 16 <= len(packet):
+        length, header, version, op, _ = struct.unpack_from(">IHHII", packet, off)
+        if header < 16 or length < header or off + length > len(packet):
             raise ValueError("弹幕数据包长度错误")
-        body = data[off + header:off + length]
+        body = packet[off + header:off + length]
         off += length
         if op == 8:
             code = json.loads(body).get("code")
@@ -7025,23 +8904,148 @@ def _chat_parse(sid, data):
                         LIVE_WS[rid] = {"living": cmd == "LIVE",
                                         "title": str(j.get("title") or ""),
                                         "at": time.time()}
-                if cmd.startswith("DANMU_MSG") and j.get("info"):
+                data = j.get("data") if isinstance(j.get("data"), dict) else {}
+                if cmd.startswith("SUPER_CHAT_MESSAGE") \
+                        and not cmd.startswith("SUPER_CHAT_MESSAGE_JPN"):
+                    ui = data.get("user_info") or {}
+                    item = {"type": "sc", "id": str(data.get("id") or ""),
+                            "uid": str(data.get("uid") or ""),
+                            "uname": str(ui.get("uname") or ""),
+                            "face": str(ui.get("face") or ""),
+                            "price": int(data.get("price") or 0),
+                            "text": str(data.get("message") or ""),
+                            "t": int(data.get("start_time") or time.time()),
+                            "read": False}
+                    _chat_add_sc(sid, item)       # 去重 + 按列表重算金额
+                elif cmd == "SEND_GIFT":
+                    _chat_add_gift(sid, {
+                        "uid": str(data.get("uid") or ""),
+                        "uname": str(data.get("uname") or ""),
+                        "face": str(data.get("face") or ""),
+                        "gift": str(data.get("giftName") or ""),
+                        "num": int(data.get("num") or 1),
+                        "coin": int(data.get("total_coin") or 0),
+                        "coin_type": str(data.get("coin_type") or ""),
+                        "t": int(data.get("timestamp") or time.time()),
+                        "tid": str(data.get("tid") or "")})
+                elif cmd == "SEND_GIFT_V2":
+                    # 现在的主流格式：JSON 外壳 + data.pb（protobuf）。不解析就一条礼物都没有。
+                    try:
+                        _chat_add_gift(sid, _gift_from_pb(base64.b64decode(data.get("pb") or "")))
+                    except Exception:
+                        pass
+                elif cmd == "GUARD_BUY":
+                    g = {"type": "guard", "uid": str(data.get("uid") or ""),
+                         "uname": str(data.get("username") or ""),
+                         "level": int(data.get("guard_level") or 0),
+                         "num": int(data.get("num") or 1),
+                         "price": int(data.get("price") or 0),
+                         "t": int(data.get("start_time") or time.time())}
+                    g["src"] = "ws"
+                    st0 = chat_state(sid)
+                    with CHAT_LOCK:
+                        arr = [x for x in st0["guards"] if x["uid"] != g["uid"]]
+                        arr.append(g)
+                        st0["guards"] = arr[-200:]
+                    _chat_broadcast(sid, g)
+                elif cmd == "ONLINE_RANK_V2":
+                    lst = []
+                    for x in (data.get("list") or [])[:60]:
+                        lst.append({"uid": str(x.get("uid") or ""),
+                                    "uname": str(x.get("uname") or ""),
+                                    "face": str(x.get("face") or ""),
+                                    "score": int(x.get("score") or 0),
+                                    "guard": int(x.get("guard_level") or 0)})
+                    st0 = chat_state(sid)
+                    with CHAT_LOCK:
+                        st0["viewers"] = lst
+                elif cmd == "WATCHED_CHANGE":
+                    st0 = chat_state(sid)
+                    with CHAT_LOCK:
+                        st0["stats"]["watched"] = int(data.get("num") or 0)
+                elif cmd == "ONLINE_RANK_COUNT":
+                    n = int(data.get("online_count") or data.get("count") or 0)
+                    st0 = chat_state(sid)
+                    with CHAT_LOCK:
+                        st0["stats"]["online"] = n
+                elif cmd == "LIKE_INFO_V3_UPDATE":
+                    st0 = chat_state(sid)
+                    with CHAT_LOCK:
+                        st0["stats"]["likes"] = int(data.get("click_count") or 0)
+                elif cmd in ("INTERACT_WORD", "INTERACT_WORD_V2"):
+                    if cmd == "INTERACT_WORD":
+                        mt = int(data.get("msg_type") or 0)
+                        e = {"uid": str(data.get("uid") or ""),
+                             "uname": str(data.get("uname") or ""),
+                             "face": str(data.get("face") or ""),
+                             "t": int(data.get("timestamp") or time.time()),
+                             "follow": mt == 2}
+                    else:
+                        # V2：data.pb 是 protobuf（实测房间只推这一种，不解析就 0 条进出）
+                        try:
+                            e = _interact_from_pb(base64.b64decode(data.get("pb") or ""))
+                        except Exception:
+                            e = None
+                        mt = (e or {}).get("msg_type") or 0
+                    if e and mt in (1, 2):                 # 1 进入 / 2 关注
+                        _chat_add_enter(sid, e)
+                if cmd == "DANMU_MSG" and j.get("info"):
                     info = j["info"]
                     who = info[2] or []
-                    _chat_broadcast(sid, {"type": "danmaku", "uid": who[0] or 0,
-                                          "uname": who[1] or "", "text": info[1] or ""})
+                    # ⚠️ 变量名不能叫 payload：它会**遮蔽函数参数**（整包字节），
+                    #    之后 while 的 `len(payload)` 变成 dict 的键数 —— 同一批里
+                    #    后面的礼物 / SC / 上舰会被整段丢掉（v1.9.33 实测踩到）。
+                    ev = {"type": "danmaku", "uid": who[0] or 0,
+                          "uname": who[1] or "", "text": info[1] or "",
+                          "t": int(time.time()),
+                          "admin": bool(len(who) > 2 and who[2]),
+                          "guard": int(info[7]) if len(info) > 7 and isinstance(info[7], int) else 0}
+                    # 粉丝牌：info[3] = [等级, 牌子名, 主播名, ...]，面板上要显示「等级+牌子」
+                    try:
+                        md = info[3] if len(info) > 3 else None
+                        if isinstance(md, list) and md and isinstance(md[0], int) and md[0] > 0:
+                            ev["medal"] = {"level": md[0],
+                                           "name": str(md[1] or "")[:12]}
+                    except Exception:
+                        pass
+                    st0 = chat_state(sid)
+                    with CHAT_LOCK:
+                        st0["stats"]["danmaku"] += 1
+                    # info[0][13] 是表情弹幕的元数据（{} 表示普通弹幕）。
+                    # 只放行 hdslb 的图，别把任意 url 交给前端去加载。
+                    try:
+                        raw = info[0][13] if len(info[0]) > 13 else None
+                        if isinstance(raw, dict) and raw.get("emoticon_unique"):
+                            u = str(raw.get("url") or "").replace("http://", "https://")
+                            if u.startswith("https://") and "hdslb.com" in u:
+                                ev["emoticon"] = {
+                                    "unique": str(raw.get("emoticon_unique")),
+                                    "url": u,
+                                    "w": int(raw.get("width") or 0),
+                                    "h": int(raw.get("height") or 0)}
+                    except Exception:
+                        pass
+                    _chat_broadcast(sid, ev)
+                    _song_try_add(sid, ev)
             except Exception:
                 pass
     return authenticated
 
 
-def _chat_worker(sid):
+def _chat_worker(sid, room=None):
     st = chat_state(sid)
     st["worker"].update(running=True, error="")
-    _CUR.station = find_station(sid)      # 后台线程：不绑就会连到主站房间去
+    if room:
+        # 监控室可盯注册表之外的房间：给线程一个最小上下文，cur_room() 才有值
+        _CUR.station = {"id": sid, "room": str(room), "mid": ""}
+    else:
+        _CUR.station = find_station(sid)  # 后台线程：不绑就会连到主站房间去
     try:
         while True:
             with CHAT_LOCK:
+                if st.get("ephemeral") and st.get("keep") \
+                        and time.time() - float(st.get("keep_at") or 0) > 90:
+                    st["keep"] = False
                 if not st["subs"] and not st.get("keep"):
                     break
             sock = None
@@ -7147,6 +9151,383 @@ def chat_unsubscribe(sid, q):
     with CHAT_LOCK:
         if q in st["subs"]:
             st["subs"].remove(q)
+
+
+ROOM_CHAT_MAX = 6            # 同时盯的弹幕路数：再多就是 6 条 B 站 WS + 6 份解析线程
+
+
+def _room_key(room):
+    return "room:" + str(room)
+
+
+def api_room_chat(room, since=0):
+    """监控室按房间取弹幕增量（轮询）。返回 seq 之后的条目，客户端自己维护 since。
+
+    为什么不用 SSE：一个格子一条 HTTP 长连接，6 路就把同源连接用满了；轮询是
+    短请求，格子的开关互不影响，也不会跟画面墙抢连接。
+    """
+    room = str(room or "").strip()
+    if not room.isdigit():
+        return 400, {"error": "房间号不合法"}
+    key = _room_key(room)
+    st = chat_state(key)          # 内部会拿一次锁，不能套在下面的 with 里（Lock 不可重入）
+    with CHAT_LOCK:
+        active = sum(1 for k, v in CHAT.items()
+                     if k.startswith("room:") and v["worker"]["running"])
+        if not st["worker"]["running"]:
+            if active >= ROOM_CHAT_MAX:
+                return 429, {"error": "同时最多看 %d 路弹幕，请先关掉几路" % ROOM_CHAT_MAX}
+            st["ephemeral"] = True
+            st["keep"] = True
+            st["keep_at"] = time.time()
+            t = threading.Thread(target=_chat_worker, args=(key, room), daemon=True)
+            st["worker"]["thread"] = t
+            t.start()
+        else:
+            st["keep"] = True
+            st["keep_at"] = time.time()
+        seq = int(st.get("seq") or 0)
+        items = [x for x in list(st.get("ring") or []) if int(x["seq"]) > int(since)][-50:]
+        wk = dict(st["worker"])
+    return 200, {"ok": True, "room": room, "seq": seq, "items": items,
+                 "state": {"running": bool(wk.get("running")), "error": wk.get("error") or ""},
+                 "logged": bool(load_credentials()[0])}
+
+
+# ---------------------------------------------------------------- 弹幕板五面板
+# 数据都来自同一条 B 站弹幕 WS（见 _chat_parse_nested 里的 SUPER_CHAT_MESSAGE /
+# SEND_GIFT / GUARD_BUY / ONLINE_RANK_V2 / WATCHED_CHANGE ...）。
+# 这里只做聚合与「点歌队列」：点歌**不放音**（不接网易云/QQ 音乐，避免登录与版权问题），
+# 只维护「观众发点歌 → 主播通过/跳过 → 下一首」的队列，与 Danmist 的面板交互对齐。
+SONGS = {}                    # "room:<room>" -> {"seq", "items", "cur"}
+SONG_RE = re.compile(r"^[点點]歌\s*[:：]?\s*(.{1,40})$")
+SONG_PER_USER = 2             # 每人同时最多排 2 首（Danmist 默认值）
+
+
+def _songs(sid):
+    st = SONGS.get(sid)
+    if st is None:
+        st = {"seq": 0, "items": [], "cur": ""}
+        SONGS[sid] = st
+    return st
+
+
+def _song_try_add(sid, payload):
+    text = str(payload.get("text") or "").strip()
+    m = SONG_RE.match(text)
+    if not m:
+        return
+    song = m.group(1).strip()
+    if not song:
+        return
+    uid = str(payload.get("uid") or "")
+    st = _songs(sid)
+    with CHAT_LOCK:
+        wait = [x for x in st["items"] if x["state"] in ("wait", "queued")]
+        if uid and sum(1 for x in wait if x["uid"] == uid) >= SONG_PER_USER:
+            return
+        if any(x["song"] == song for x in wait):
+            return
+        st["seq"] += 1
+        st["items"].append({"id": "s%d" % st["seq"], "uid": uid,
+                            "name": str(payload.get("uname") or ""), "song": song,
+                            "t": int(time.time()), "state": "wait"})
+        del st["items"][:-80]
+
+
+def _songs_snap(sid):
+    with CHAT_LOCK:
+        st = SONGS.get(sid) or {"items": [], "cur": ""}
+        return {"items": [dict(x) for x in st["items"]], "cur": st.get("cur") or ""}
+
+
+BOARD_META_TTL = 60          # 观众榜 / 看过 的刷新间隔（B 站接口，别打太勤）
+BOARD_HIST_TTL = 300         # SC 快照 / 舰长名册：5 分钟补一次就够（变化很慢）
+
+
+def _board_meta_fetch(room):
+    """观众榜与「看过」走 HTTP 补一次（后台线程，不占轮询）。
+
+    为什么不只靠弹幕 WS：`ONLINE_RANK_V2` / `WATCHED_CHANGE` 是**按需推送**的，
+    实测有的房间根本收不到（观众面板会一直空着）。Danmist 也是走
+    `getInfoByRoom` + `rank/queryContributionRank` 这两个接口取名单。
+    ⚠️ `room_info.online` 是**人气**，不是在线人数；在线仍以 WS 的
+       ONLINE_RANK_COUNT 为准，只有在它还没到时才拿榜单条数兜底。
+    """
+    key = _room_key(room)
+    st = chat_state(key)
+    with CHAT_LOCK:
+        st["meta_busy"] = True       # 调用方可能已经占位，这里只保证置位
+    try:
+        url = wbi_signed("https://api.live.bilibili.com/xlive/web-room/v1/index/getInfoByRoom",
+                         {"room_id": room})
+        d = bili_get(url, referer="https://live.bilibili.com/%s" % room, fallback_anon=True)
+        data = d.get("data") or {}
+        ri = data.get("room_info") or {}
+        ws = data.get("watched_show") or {}
+        uid = str(ri.get("uid") or "")
+        top, seen, online = [], set(), 0
+        if uid:
+            for page in range(1, 4):
+                u2 = ("https://api.live.bilibili.com/xlive/general-interface/v1/rank/"
+                      "queryContributionRank?ruid=%s&room_id=%s&page=%d&page_size=100"
+                      "&type=online_rank&switch=contribution_rank" % (uid, room, page))
+                g = (bili_get(u2, referer="https://live.bilibili.com/%s" % room,
+                              fallback_anon=True).get("data") or {})
+                fresh = [x for x in (g.get("item") or [])
+                         if str(x.get("uid")) not in seen]
+                for x in fresh:
+                    seen.add(str(x.get("uid")))
+                    medal = x.get("medal_info") or {}
+                    top.append({"uid": str(x.get("uid") or ""),
+                                "uname": str(x.get("name") or ""),
+                                "face": str(x.get("face") or ""),
+                                "score": int(x.get("score") or 0),
+                                "guard": int(medal.get("guard_level") or 0)})
+                online = max(online, int(g.get("count") or 0), len(top))
+                total = int(g.get("count") or 0)
+                if not fresh or len(top) >= total or len(top) >= 120:
+                    break
+                time.sleep(0.3)
+        live_start = int(ri.get("live_start_time") or 0)
+        with CHAT_LOCK:
+            if top:
+                st["viewers"] = top[:120]
+            if not st["stats"].get("online"):
+                st["stats"]["online"] = online
+            if ws.get("num"):
+                st["stats"]["watched"] = int(ws.get("num") or 0)
+            if live_start:
+                st["live_start"] = live_start
+            st["meta_at"] = time.time()
+            need_hist = time.time() - float(st.get("hist_at") or 0) > BOARD_HIST_TTL
+            if need_hist:
+                st["hist_at"] = time.time()      # 先占位，避免同一秒起两个线程
+        if need_hist:
+            _board_hist_fetch(room, uid, live_start or int(st.get("live_start") or 0))
+    except Exception as e:
+        print("[board] 观众榜/看过获取失败：%s" % e)
+    finally:
+        with CHAT_LOCK:
+            st["meta_busy"] = False
+
+
+def _board_hist_fetch(room, uid, live_start):
+    """HTTP 补「本场 SC」与「大航海名册」。
+
+    为什么必须补：弹幕 WS 只在**连上之后**推增量，开播那几小时发生的事一概没有。
+      · SC：`/av/v1/SuperChat/getMessageList` 是公开快照（最多 100 条），
+        用 getInfoByRoom 的 live_start_time 把上一场的残留裁掉；
+      · 舰长：WS 只在「有人上舰」时推 GUARD_BUY，已经在舰上的一个都不会出现，
+        `/xlive/app-room/v2/guardTab/topList` 按 num 翻页拿当前名册。
+    """
+    key = _room_key(room)
+    st = chat_state(key)
+    ref = "https://live.bilibili.com/%s" % room
+    with CHAT_LOCK:
+        st["hist_busy"] = True
+    failed = False
+    try:
+        d = bili_get("https://api.live.bilibili.com/av/v1/SuperChat/getMessageList"
+                     "?room_id=%s" % room, referer=ref, fallback_anon=True) or {}
+        lst = (d.get("data") or {}).get("list") or []
+        added = 0
+        for x in lst:
+            t = int(x.get("start_time") or 0)
+            if live_start and t and t < live_start - 120:      # 上一场的 SC 不算本场
+                continue
+            ui = x.get("user_info") or {}
+            if _chat_add_sc(key, {"type": "sc", "id": str(x.get("id") or ""),
+                                  "uid": str(x.get("uid") or ""),
+                                  "uname": str(ui.get("uname") or ""),
+                                  "face": str(ui.get("face") or ""),
+                                  "price": int(x.get("price") or 0),
+                                  "text": str(x.get("message") or ""),
+                                  "t": t or int(time.time()), "read": False}):
+                added += 1
+        with CHAT_LOCK:
+            st["hist_sc"] += added
+        print("[board] SC 快照 %d 条（接口 %d 条）" % (added, len(lst)))
+    except Exception as e:
+        failed = True
+        print("[board] SC 快照获取失败：%s" % e)
+
+    if not uid:
+        with CHAT_LOCK:
+            st["hist_busy"] = False        # 没有 uid 就不拉名册，但别把「加载中」挂住
+        return
+    try:
+        got, page = {}, 1
+        while page <= 7 and len(got) < 200:
+            u = ("https://api.live.bilibili.com/xlive/app-room/v2/guardTab/topList"
+                 "?roomid=%s&page=%d&ruid=%s&page_size=30" % (room, page, uid))
+            d = bili_get(u, referer=ref, fallback_anon=True) or {}
+            data = d.get("data") or {}
+            total = int((data.get("info") or {}).get("num") or 0)
+            for x in (data.get("list") or []):
+                g_uid = str(x.get("uid") or "")
+                if not g_uid or g_uid in got:
+                    continue
+                got[g_uid] = {"type": "guard", "uid": g_uid,
+                              "uname": str(x.get("username") or ""),
+                              "face": str(x.get("face") or ""),
+                              "level": int(x.get("guard_level") or 0),
+                              "num": 1, "price": 0, "t": 0, "src": "list"}
+            # ⚠️ 停止条件按「已收人数」而不是页数：接口的 page_size 会被压到 25，
+            #    用 page*30 判断会在 100 人就提前收工（117 位舰长的房间少 17 个）。
+            if not (data.get("list") or []) or len(got) >= total:
+                break
+            page += 1
+            time.sleep(0.25)
+        if got:
+            with CHAT_LOCK:
+                have = {x["uid"] for x in st["guards"]}
+                for g_uid, g2 in got.items():
+                    if g_uid not in have:
+                        st["guards"].append(g2)
+                st["guards"] = st["guards"][-200:]
+        print("[board] 舰长名册 %d 位" % len(got))
+    except Exception as e:
+        failed = True
+        print("[board] 舰长名册获取失败：%s" % e)
+    finally:
+        with CHAT_LOCK:
+            st["hist_busy"] = False
+            if failed:
+                # 失败不能占满 5 分钟：60 秒后重试（B 站 412 是间歇的，等一轮多半就好了）
+                st["hist_at"] = time.time() - BOARD_HIST_TTL + 60
+
+
+def api_live_song(obj):
+    room = str(obj.get("room") or "").strip()
+    if not room.isdigit():
+        return 400, {"error": "房间号不合法"}
+    act = str(obj.get("act") or "")
+    sid = _room_key(room)
+    st = _songs(sid)
+    target = str(obj.get("id") or "")
+    with CHAT_LOCK:
+        items = st["items"]
+        if act == "ok":
+            for x in items:
+                if x["id"] == target and x["state"] == "wait":
+                    x["state"] = "queued"
+                    break
+        elif act == "skip":
+            for x in items:
+                if x["id"] == target and x["state"] in ("wait", "queued", "playing"):
+                    x["state"] = "skipped"
+                    break
+            if st.get("cur") == target:
+                st["cur"] = ""
+        elif act == "next":
+            if st.get("cur"):
+                for x in items:
+                    if x["id"] == st["cur"]:
+                        x["state"] = "played"
+                        break
+            st["cur"] = ""
+            for x in items:
+                if x["state"] == "queued":
+                    x["state"] = "playing"
+                    st["cur"] = x["id"]
+                    break
+        elif act == "clear":
+            for x in items:
+                if x["state"] in ("wait", "queued", "playing"):
+                    x["state"] = "skipped"
+            st["cur"] = ""
+        else:
+            return 400, {"error": "未知操作"}
+    return 200, {"ok": True, "songs": _songs_snap(sid)}
+
+
+def api_board_read(obj):
+    """SC 面板的「已读」：服务端记住，多个页面（弹幕板/监控室）看到同一份状态。"""
+    room = str(obj.get("room") or "").strip()
+    if not room.isdigit():
+        return 400, {"error": "房间号不合法"}
+    st = chat_state(_room_key(room))
+    ids = obj.get("ids")
+    with CHAT_LOCK:
+        for x in st["sc"]:
+            if x.get("read"):
+                continue
+            if obj.get("all") or (isinstance(ids, list) and str(x.get("id")) in
+                                  [str(i) for i in ids]):
+                x["read"] = True
+    return 200, {"ok": True, "sc": [dict(x) for x in st["sc"][-80:]]}
+
+
+def api_live_board(room, since=0):
+    """弹幕板：增量弹幕 + 五面板的快照（SC / 礼物 / 观众 / 统计 / 点歌）。
+
+    为什么不复用 /api/live/chat/recent：那个接口被监控室的每一路格子高频轮询，
+    塞进整份快照（观众榜 60 条 + 礼物 60 条）会让 6 路轮询变成几十 KB/秒。
+    """
+    room = str(room or "").strip()
+    if not room.isdigit():
+        return 400, {"error": "房间号不合法"}
+    key = _room_key(room)
+    st = chat_state(key)
+    with CHAT_LOCK:
+        active = sum(1 for k, v in CHAT.items()
+                     if k.startswith("room:") and v["worker"]["running"])
+        if not st["worker"]["running"]:
+            if active >= ROOM_CHAT_MAX:
+                return 429, {"error": "同时最多看 %d 路弹幕，请先关掉几路" % ROOM_CHAT_MAX}
+            st["ephemeral"] = True
+            st["keep"] = True
+            st["keep_at"] = time.time()
+            t = threading.Thread(target=_chat_worker, args=(key, room), daemon=True)
+            st["worker"]["thread"] = t
+            t.start()
+        else:
+            st["keep"] = True
+            st["keep_at"] = time.time()
+        # 观众榜 / 看过：到点就在后台补一次（WS 不一定推这两类命令）
+        need_meta = time.time() - float(st.get("meta_at") or 0) > BOARD_META_TTL \
+            and not st.get("meta_busy")
+        if need_meta:
+            st["meta_busy"] = True          # 先占位，避免同一秒起多个线程
+        seq = int(st.get("seq") or 0)
+        ring = [x for x in list(st.get("ring") or []) if int(x["seq"]) > int(since)][-120:]
+        items = [x for x in ring
+                 if (x.get("item") or {}).get("type")
+                 in ("danmaku", "sc", "gift", "guard", "enter")]
+        sg = SONGS.get(key) or {"items": [], "cur": ""}
+        snap = {
+            "sc": [dict(x) for x in st["sc"][-80:]],
+            "gifts": sorted([dict(x) for x in st["gifts"].values()],
+                            key=lambda x: -int(x.get("t") or 0))[:60],
+            "viewers": [dict(x) for x in st["viewers"]],
+            "enters": [dict(x) for x in st["enters"][-80:]],
+            "guards": [dict(x) for x in st["guards"][-100:]],
+            "stats": dict(st["stats"]),
+            # ⚠️ 不能调 _songs_snap()：它内部还要拿一次 CHAT_LOCK，而这里已经持锁
+            # （Lock 不可重入，实测直接把这个接口焊死，整条弹幕管线跟着卡住）。
+            "songs": {"items": [dict(x) for x in sg["items"]], "cur": sg.get("cur") or ""},
+            "hist": {"sc": int(st.get("hist_sc") or 0),
+                     "live_start": int(st.get("live_start") or 0),
+                     "loading": bool(st.get("hist_busy"))},
+        }
+        wk = dict(st["worker"])
+    if need_meta:
+        threading.Thread(target=_board_meta_fetch, args=(room,), daemon=True).start()
+    return 200, {"ok": True, "room": room, "seq": seq, "items": items, "snap": snap,
+                 "state": {"running": bool(wk.get("running")),
+                           "error": wk.get("error") or ""},
+                 "logged": bool(load_credentials()[0])}
+
+
+def api_room_chat_stop(room):
+    room = str(room or "").strip()
+    if not room.isdigit():
+        return 400, {"error": "房间号不合法"}
+    st = chat_state(_room_key(room))
+    with CHAT_LOCK:
+        st["keep"] = False
+    return 200, {"ok": True}
 
 
 def api_login_qrcode():
@@ -8851,6 +11232,10 @@ class Handler(SimpleHTTPRequestHandler):
         if parsed.path == "/api/status":
             code, obj = api_status("refresh" in q)
             return self._json(code, obj)
+        if parsed.path == "/api/update/check":
+            return self._json(*api_update_check())
+        if parsed.path == "/api/update/status":
+            return self._json(*api_update_status())
         if parsed.path == "/api/ping":
             # 只回答「我是谁」。给启动时的实例探测用 —— 不能复用 /api/status，
             # 那个要问 B 站接口，慢的时候会把本服务误判成「别的程序」。
@@ -8861,7 +11246,8 @@ class Handler(SimpleHTTPRequestHandler):
             # 不知道是网络坏了还是被限流、还要等多久。
             _left = max(0, int(max(_BAN["until"], _BAN_LIVE["until"]) - time.time()))
             return self._json(200, {"app": APP_TAG, "lyrics": True,
-                                    "build": read_build_stamp(), "ban_left": _left})
+                                    "build": read_build_stamp(), "ban_left": _left,
+                                    "version": APP_VERSION})
         if parsed.path == "/api/quit":
             # 供「停止」脚本调用。服务只绑 127.0.0.1，外部访问不到。
             # ⚠️ 现在要先给正在录的 ffmpeg 写 q 收尾（否则最后几秒丢），
@@ -9008,6 +11394,32 @@ class Handler(SimpleHTTPRequestHandler):
             return self._json(*page_alive(q.get("cid", [""])[0] or "anon"))
         if parsed.path == "/api/live/wheel":
             return self._json(*api_live_wheel_status())
+        if parsed.path == "/api/live/brief":
+            return self._json(*api_live_brief())
+        if parsed.path == "/api/live/recommend":
+            return self._json(*api_live_recommend(q.get("area", ["9"])[0]))
+        if parsed.path == "/api/live/guilds":
+            return self._json(*api_guilds())
+        if parsed.path == "/api/live/guild":
+            return self._json(*api_guild_live(q.get("name", [""])[0]))
+        if parsed.path == "/api/live/chat/recent":
+            return self._json(*api_room_chat(q.get("room", [""])[0],
+                                             parse_int(q.get("since", ["0"])[0], 0)))
+        if parsed.path == "/api/live/chat/stop":
+            return self._json(*api_room_chat_stop(q.get("room", [""])[0]))
+        if parsed.path == "/api/live/board":
+            return self._json(*api_live_board(q.get("room", [""])[0],
+                                              parse_int(q.get("since", ["0"])[0], 0)))
+        if parsed.path == "/api/vtbs/status":
+            return self._json(*api_vtbs_status())
+        if parsed.path == "/api/vtbs/profile":
+            return self._json(*api_vtbs_profile(q.get("mid", [""])[0]))
+        if parsed.path == "/api/danmist/status":
+            return self._json(*api_danmist_status())
+        if parsed.path == "/api/live/emoticons":
+            return self._json(*api_live_emoticons("refresh" in q, q.get("room", [""])[0]))
+        if parsed.path == "/api/feedback/conf":
+            return self._json(*api_feedback_conf())
         if parsed.path == "/api/live/playinfo":
             return self._json(*api_live_playinfo(q))
         if parsed.path == "/api/live/resolve":
@@ -9079,6 +11491,11 @@ class Handler(SimpleHTTPRequestHandler):
                 return self._json(400, {"error": str(exc)})
             except Exception:
                 return self._json(502, {"error": "直播礼物服务暂时不可用，请稍后查看"})
+        if parsed.path == "/api/update/download":
+            return self._json(*api_update_download(obj))
+        if parsed.path == "/api/update/apply":
+            return self._json(*api_update_apply())
+
         if parsed.path == "/api/playlist/import":
             return self._json(*api_playlist_import(obj))
         if parsed.path == "/api/playlist/like":
@@ -9167,6 +11584,24 @@ class Handler(SimpleHTTPRequestHandler):
                 return self._json(400, {"error": "本机没找到 ffmpeg，无法做分段"})
             queued = segments_enqueue(bvid, _find_program(bvid))
             return self._json(200, {"ok": True, "queued": queued})
+        if parsed.path == "/api/guild/add":
+            return self._json(*api_guild_add(obj))
+        if parsed.path == "/api/live/song":
+            return self._json(*api_live_song(obj))
+        if parsed.path == "/api/live/board/read":
+            return self._json(*api_board_read(obj))
+        if parsed.path == "/api/vtbs/refresh":
+            return self._json(*api_vtbs_refresh())
+        if parsed.path == "/api/live/guild/refresh":
+            return self._json(*api_guild_refresh(obj.get("name", "")))
+        if parsed.path == "/api/danmist/start":
+            return self._json(*api_danmist_start())
+        if parsed.path == "/api/feedback":
+            return self._json(*api_feedback(obj))
+        if parsed.path == "/api/feedback/upload":
+            return self._json(*api_feedback_upload(obj))
+        if parsed.path == "/api/feedback/reveal":
+            return self._json(*api_feedback_reveal(obj))
         if parsed.path == "/api/live/send":
             return self._json(*api_live_send(obj))
         if parsed.path == "/api/live/wheel/start":
